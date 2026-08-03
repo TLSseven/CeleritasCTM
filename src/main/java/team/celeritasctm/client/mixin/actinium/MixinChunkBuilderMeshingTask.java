@@ -2,6 +2,7 @@ package team.celeritasctm.client.mixin.actinium;
 
 import com.dhj.actinium.render.terrain.compile.VintageChunkBuildContext;
 import com.dhj.actinium.render.terrain.compile.task.ChunkBuilderMeshingTask;
+import net.minecraft.block.Block;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.renderer.BlockRendererDispatcher;
 import net.minecraft.client.renderer.BufferBuilder;
@@ -44,6 +45,23 @@ public abstract class MixinChunkBuilderMeshingTask {
     // 当前 chunk 构建上下文（execute HEAD 捕获；ChunkBuilder 线程池每线程独立）
     @Unique
     private static final ThreadLocal<VintageChunkBuildContext> FOLIAGE$BUILD_CONTEXT = new ThreadLocal<>();
+
+    // BF 假植物写入光影 context 用的方块 state：优先 conquest:crop_corn（光影 1.12 段
+    // block.80=SSS_STRONG，不摇动+SSS，与 cypress/corn 同类处理），fallback
+    // minecraft:grass（block.85=GRASS，不摇动+SSS）。
+    @Unique
+    private static final IBlockState FOLIAGE$PLANT_STATE = foliage$resolvePlantState();
+
+    @Unique
+    private static IBlockState foliage$resolvePlantState() {
+        try {
+            Block corn = Block.getBlockFromName("conquest:crop_corn");
+            if (corn != null) {
+                return corn.getDefaultState();
+            }
+        } catch (Throwable ignored) {}
+        return Blocks.GRASS.getDefaultState();
+    }
 
     @Unique
     private static Field foliage$findRenderLayerField() {
@@ -103,18 +121,19 @@ public abstract class MixinChunkBuilderMeshingTask {
         // BF 附加几何（芦苇/珊瑚/海藻等 getAddToCutout handler）：SOLID 方块额外在
         // CUTOUT_MIPPED 层调 BF——该层 can=false，BF 只画附加几何，不重复画本体。
         //
-        // 光影兼容：假植物写入的 quad context 默认带宿主方块 id（沙/泥→固体材质），
-        // 光影按固体处理（不摇动、无植物 pass）。这里把 context 的方块改为
-        // minecraft:reeds——光影 block.properties 中 block.54（GROUND_WAVING 摇动植物）
-        // 包含 minecraft:reeds，假植物即按植物材质渲染（随风摇动 + 植物光照）。
+        // 光影兼容：假植物写入的 quad context 默认带宿主方块 id（沙/泥→固体材质）。
+        // 用 minecraft:reeds（block.54 GROUND_WAVING）会让两格高的芦苇按顶点世界坐标
+        // 分段摇动（光影摇动相位=顶点位置，跨两格即两段独立相位）。因此改用不摇动的
+        // 植物材质（conquest:crop_corn→block.80 SSS_STRONG，fallback grass→block.85
+        // GRASS）：整株静止 + 次表面散射，与 cypress/corn 的处理一致。
         // 附加几何是 BF 画出的假植物（沙/泥本身不在 CUTOUT 层渲染），整段 buffer
-        // 内容都是植物，用 reeds id 不会影响宿主方块本体。
+        // 内容都是植物，用植物 id 不会影响宿主方块本体。
         if (bf && layer == BlockRenderLayer.SOLID && BetterFoliageCompat.mayHaveFoliage(state)) {
             VintageChunkBuildContext buildContext = FOLIAGE$BUILD_CONTEXT.get();
             if (buildContext != null) {
                 try {
                     BufferBuilder cutout = buildContext.getBufferForLayer(BlockRenderLayer.CUTOUT_MIPPED);
-                    buildContext.beginVanillaBlockRender(cutout, pos, Blocks.REEDS.getDefaultState());
+                    buildContext.beginVanillaBlockRender(cutout, pos, FOLIAGE$PLANT_STATE);
                     try {
                         BetterFoliageCompat.renderWorldBlock(dispatcher, state, pos, access, cutout,
                             BlockRenderLayer.CUTOUT_MIPPED);
