@@ -1,0 +1,202 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        maven { url = 'https://maven.cleanroommc.com' }
+        maven { url = 'https://maven.aliyun.com/repository/public' }
+        maven { url = 'https://maven.aliyun.com/repository/gradle-plugin' }
+    }
+}
+
+plugins {
+    id 'java'
+    id 'java-library'
+    id 'maven-publish'
+    id 'xyz.wagyourtail.unimined' version '1.4.26-kappa'
+}
+
+apply from: 'gradle/scripts/helpers.gradle'
+
+// ========== Properties Helpers ==========
+
+String propertyString(String key) {
+    return project.findProperty(key)?.toString() ?: ''
+}
+
+Boolean propertyBool(String key) {
+    return propertyString(key).toBoolean()
+}
+
+void assertProperty(String key) {
+    if (propertyString(key).isEmpty()) {
+        throw new GradleException("Property ${key} is required but not set")
+    }
+}
+
+// ========== Project Configuration ==========
+
+version = propertyString('mod_version')
+group = propertyString('root_package')
+
+base {
+    archivesName = propertyString('mod_name')
+}
+
+java {
+    // 需要引用 Actinium 的 record 类（RenderPassConfiguration），Java 8 无法解析
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+// ========== Repositories ==========
+
+// ========== Repositories ==========
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.cleanroommc.com' }
+    maven { url = 'https://cursemaven.com' }
+    maven { url = 'https://api.modrinth.com/maven' }
+    maven { url = 'https://maven.aliyun.com/repository/public' }
+    maven { url = 'https://maven.aliyun.com/repository/central' }
+    mavenLocal()
+}
+
+// ========== Dependencies ==========
+
+configurations {
+    embed
+    implementation.extendsFrom(embed)
+    modCompileOnly
+    compileOnly.extendsFrom(modCompileOnly)
+    modRuntimeOnly
+    runtimeOnly.extendsFrom(modRuntimeOnly)
+}
+
+dependencies {
+    // Mixin - provided by Cleanroom loader at runtime
+    compileOnly 'org.spongepowered:mixin:0.8.5'
+
+    // Actinium（Sodium/Celeritas 渲染管线）——编译期引用 VintageBlockRenderer
+    compileOnly files('E:/Opencode/Actinium/build/libs/Actinium-2.4.0-dev.jar')
+    
+    // GTNHLib (optional - for advanced features)
+    // modCompileOnly 'com.github.GTNewHorizons:GTNHLib:2.1.17:dev'
+}
+
+// ========== Unimined (Minecraft/Cleanroom) ==========
+
+unimined.minecraft {
+    version = '1.12.2'
+
+    mappings {
+        mcp 'stable', '39-1.12'
+    }
+
+    cleanroom {
+        loader propertyString('cleanroom_loader_version')
+
+        runs.all {
+            args += ['--username', propertyString('minecraft_username')]
+            
+            def extraPathArgument = '-Dcrl.dev.extrapath='
+            def extraPaths = new LinkedHashSet<String>()
+            extraPaths.addAll(project.sourceSets.main.output.files.collect { it.absolutePath })
+            jvmArgs.findAll { it.toString().startsWith(extraPathArgument) }.each { argument ->
+                extraPaths.addAll(argument.toString().substring(extraPathArgument.length()).tokenize(File.pathSeparator))
+            }
+            jvmArgs = jvmArgs.findAll { !it.toString().startsWith(extraPathArgument) }
+            jvmArgs += "${extraPathArgument}${extraPaths.join(File.pathSeparator)}"
+        }
+    }
+
+    defaultRemapJar = true
+
+    mods {
+        remap(configurations.modCompileOnly)
+        remap(configurations.modRuntimeOnly)
+    }
+}
+
+// ========== Resource Processing ==========
+
+processResources {
+    def resourceProperties = [
+        'mod_id'         : propertyString('mod_id'),
+        'mod_name'       : propertyString('mod_name'),
+        'mod_version'    : propertyString('mod_version'),
+        'mod_description': propertyString('mod_description'),
+        'mod_authors'    : propertyString('mod_authors'),
+        'mod_credits'    : propertyString('mod_credits'),
+        'mod_url'        : propertyString('mod_url')
+    ]
+
+    inputs.properties(resourceProperties)
+    filteringCharset = 'UTF-8'
+
+    filesMatching(['mcmod.info', 'pack.mcmeta']) {
+        expand(resourceProperties)
+        filter { line ->
+            resourceProperties.inject(line) { acc, entry ->
+                acc.replace("{{ ${entry.key} }}", entry.value).replace("{{${entry.key}}}", entry.value)
+            }
+        }
+    }
+}
+
+// ========== JAR Manifest ==========
+
+jar {
+    manifest {
+        attributes(
+            'ModType': 'CRL',
+            'MixinConfigs': propertyString('mixin_configs')
+        )
+    }
+
+    from sourceSets.main.output
+    from configurations.embed.collect { it.isDirectory() ? it : zipTree(it) }
+}
+
+tasks.named('remapJar').configure {
+    doFirst {
+        logging.captureStandardOutput LogLevel.INFO
+    }
+    doLast {
+        logging.captureStandardOutput LogLevel.QUIET
+    }
+}
+
+// ========== Compile Options ==========
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    // 使用 --release 8 确保字节码兼容 Java 8
+    options.release = 8
+}
+
+tasks.named('compileJava', JavaCompile).configure {
+    // Fork使用 JDK 25 编译（因为 Cleanroom jar 需要 JDK 25 才能读取）
+    // Gradle 本身运行在 JDK 21 上
+    options.fork = true
+    options.forkOptions.javaHome = file('C:/Program Files/Zulu/zulu-25')
+}
+
+// ========== Run Configuration ==========
+
+tasks.named('runClient', JavaExec).configure {
+    workingDir = layout.projectDirectory.dir('run/client').asFile
+    jvmArgs = jvmArgs.findAll { !it.startsWith('-Xmx') }
+    maxHeapSize = '4G'
+}
+
+tasks.named('runServer', JavaExec).configure {
+    workingDir = layout.projectDirectory.dir('run/server').asFile
+}
+
+tasks.named('preRunClient').configure {
+    dependsOn tasks.named('classes')
+}
+
+tasks.named('preRunServer').configure {
+    dependsOn tasks.named('classes')
+}

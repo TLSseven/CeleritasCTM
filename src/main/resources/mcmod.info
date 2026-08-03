@@ -1,0 +1,18 @@
+[
+  {
+    "modid": "celeritasctm",
+    "name": "CeleritasCTM",
+    "description": "Connected Textures and natural textures for Actinium/Celeritas on Cleanroom 1.12.2. Implements OptiFine CTM, better grass/snow, and connected glass without modifying Actinium.",
+    "version": "${mod_version}",
+    "mcversion": "1.12.2",
+    "url": "${mod_url}",
+    "updateUrl": "",
+    "authorList": ["TLSseven"],
+    "credits": "${mod_credits}",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": [
+      "actinium"
+    ]
+  }
+]

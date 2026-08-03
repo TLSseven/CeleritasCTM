@@ -1,0 +1,30 @@
+// Helper functions for the CTM Actinium build
+// Based on Actinium's helpers.gradle - simplified
+
+ext {
+    propertyString = { String key ->
+        return project.findProperty(key)?.toString() ?: ''
+    }
+
+    propertyBool = { String key ->
+        return propertyString(key).toBoolean()
+    }
+
+    assertProperty = { String key ->
+        if (propertyString(key).isEmpty()) {
+            throw new GradleException("Property ${key} is required but not set")
+        }
+    }
+
+    assertSubProperties = { String baseKey, String... subKeys ->
+        subKeys.each { String subKey ->
+            assertProperty("${baseKey}_${subKey}")
+        }
+    }
+
+    setDefaultProperty = { String key, boolean isString, Object defaultValue ->
+        if (project.findProperty(key) == null) {
+            project.ext.set(key, isString ? defaultValue.toString() : defaultValue)
+        }
+    }
+}
