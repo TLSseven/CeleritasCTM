@@ -51,17 +51,15 @@
 
 ## 已确认兼容的模组
 
-ConquestReforged 3.0.2
-BetterFoliage 2.3.3（需要Forgelin-Continuous）
-Decocraft 2.6.3.7
-
-Aperture 1.8.2
-Blockbuster 2.7.1
-Chameleon 1.2.2
-Emoticons 1.1.2
-Metamorph 1.4
-Minema 3.7.1
-
+- ConquestReforged 3.0.2
+- BetterFoliage 2.3.3（需要Forgelin-Continuous）
+- Decocraft 2.6.3.7
+- Aperture 1.8.2
+- Blockbuster 2.7.1
+- Chameleon 1.2.2
+- Emoticons 1.1.2
+- Metamorph 1.4
+- Minema 3.7.1
 
 ---
 
