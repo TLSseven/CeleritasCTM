@@ -221,9 +221,16 @@ public class CtmBakedModel implements IBakedModel {
      * 更好的雪地判定：当前方块上方是雪层（且当前方块本身不是雪/冰，避免自覆盖）。
      */
     private static boolean isSnowCovered(RenderContext ctx) {
-        Block self = ctx.world.getBlockState(ctx.pos).getBlock();
+        IBlockState selfState = ctx.world.getBlockState(ctx.pos);
+        Block self = selfState.getBlock();
         if (self == Blocks.SNOW_LAYER || self == Blocks.SNOW || self == Blocks.ICE
                 || self == Blocks.PACKED_ICE || self == Blocks.FROSTED_ICE) {
+            return false;
+        }
+        // 只对不透明实心方块生效（OptiFine better snow 语义）：树叶等透明方块
+        // （isOpaqueCube=false，CUTOUT 层镂空）的侧面不能被雪覆盖，否则会变成
+        // 实心外观（如云杉树叶盖雪后看似绿色羊毛）。
+        if (!selfState.isOpaqueCube()) {
             return false;
         }
         IBlockState up = ctx.world.getBlockState(ctx.pos.up());
