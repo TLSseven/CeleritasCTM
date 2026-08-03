@@ -1,5 +1,7 @@
 # CeleritasCTM
 
+[English](https://github.com/TLSseven/CeleritasCTM/blob/main/README_EN.md)
+
 面向 **Minecraft 1.12.2 + Cleanroom Loader + Celeritas/Actinium** 的连接纹理（CTM）与自然纹理兼容模组，实现了Optifine的部分材质功能。
 
 > **本模组由 AI 编写，不保证后续维护。**
