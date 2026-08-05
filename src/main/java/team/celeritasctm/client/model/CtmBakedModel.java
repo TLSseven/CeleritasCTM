@@ -15,6 +15,7 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.renderer.vertex.VertexFormat;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.EnumFacing;
+import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.IBlockAccess;
@@ -190,11 +191,99 @@ public class CtmBakedModel implements IBakedModel {
             if (props == CtmPropertiesLoader.GLASS_RULE && !CeleritasCTM.config().connectedGlass) {
                 return java.util.Collections.singletonList(quad);
             }
+            // ===== 连接透明方块内部面剔除（还原 OptiFine 机制）=====
+            // 该方块有「连接类」CTM 规则（connect=block/tile 连接）+ 透明（非不透明立方体，
+            // 否则 vanilla 已剔除或不透明不可见）+ quad 是贴齐面 + 该面方向的邻居是同一
+            // 方块 → 剔除贴合内部面（返回空列表）。
+            // 邻居比较用 block 级（而非 state 级）：Conquest 竖半砖 CTM 规则是默认
+            // connect=block（同方块 ID 即连接，不看 facing/variant/metadata）。
+            // 贴齐判定用「quad 为全平面 + 邻居 bbox 内侧边贴合 quad 平面」而非顶点=0/1：
+            // 竖半砖随 facing 做 y 旋转后，贴合面在一侧的模型里可能是切面坐标（z=0.5），
+            // 只看 0/1 会漏剔一侧（表现为「一侧剔一侧不剔」）。bbox 比较对旋转/切面都正确。
+            if (isConnectingMethod(props.getMethod())
+                    && quadFace != null && blockState != null && !blockState.isOpaqueCube()
+                    && isTouchingNeighborFace(quad, quadFace, blockState, ctx)) {
+                return java.util.Collections.emptyList();
+            }
             BakedQuad baseQuad = applyRule(quad, sprite, props, ctx, quadFace, blockState, 0);
             if (baseQuad == null) baseQuad = quad;
             return java.util.Collections.singletonList(baseQuad);
         }
         return java.util.Collections.singletonList(quad);
+    }
+
+    /**
+     * 是否是「连接类」CTM 方法（通过连接检测选 tile）。
+     * random/repeat/fixed 等非连接方法不参与内部面剔除（树叶等无连接规则的透明方块
+     * 依赖 repeat 等规则时也不应被剔除，避免内部面消失）。
+     */
+    private static boolean isConnectingMethod(String method) {
+        if (method == null) return false;
+        switch (method) {
+            case "ctm":
+            case "ctm_compact":
+            case "horizontal":
+            case "vertical":
+            case "horizontal+vertical":
+            case "h+v":
+            case "vertical+horizontal":
+            case "v+h":
+            case "top":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * quad 是否为「贴齐邻居的贴合面」（内部剔除判定）：
+     * 1. 4 个顶点在 face 轴上的坐标（模型空间，相对方块原点）全部相同（quad 是平面，
+     *    非平面 quad 如花纹/斜面不参与剔除）；
+     * 2. 邻居方块与本方块同 block（connect=block 语义）；
+     * 3. quad 平面偏移与邻居 bbox 的内侧边偏移精确贴合。
+     *
+     * <p>坐标归一化：BakedQuad 顶点坐标可能是 0..1（vanilla FaceBakery 归一化）或 0..16
+     * （mod 自定义模型烘焙，如 Conquest 竖半砖），统一归一化到 0..1 再比较。
+     * bbox 用 getBoundingBox 返回的「相对方块原点 0..1 AABB」——贴合条件换算到同一
+     * 相对坐标系：A 在 face 正方向（+1 格）贴合邻居的内侧边（B.min），负方向贴合 B.max。
+     * 这样对 y 旋转过的竖半砖也正确（贴合面无论落在模型 0/1 还是 0.5，都能对上）。
+     *
+     * <p>性能：平面检查（最廉价）→ 邻居取态/block 比较（一次 getBlockState）→ bbox 贴合
+     * （仅在邻居同方块时计算），快速失败顺序避免无谓开销。
+     */
+    private static boolean isTouchingNeighborFace(BakedQuad quad, EnumFacing face, IBlockState self, RenderContext ctx) {
+        int axis;
+        switch (face) {
+            case DOWN: case UP: axis = 1; break;
+            case NORTH: case SOUTH: axis = 2; break;
+            default: axis = 0; // EAST / WEST
+        }
+        int[] data = quad.getVertexData();
+        int stride = quad.getFormat().getIntegerSize();
+        float first = Float.intBitsToFloat(data[axis]);
+        for (int i = 1; i < 4; i++) {
+            float v = Float.intBitsToFloat(data[i * stride + axis]);
+            if (Math.abs(v - first) > 0.001f) return false;
+        }
+        // 顶点坐标 0..16（mod 自定义模型）→ 归一化到 0..1
+        float first01 = (first > 1.5f) ? first / 16.0f : first;
+        if (first01 < -0.01f || first01 > 1.01f) return false;
+        // 邻居：同方块才可能贴合（connect=block 语义，不看 facing/variant）
+        BlockPos npos = ctx.pos.offset(face);
+        IBlockState neighbor = ctx.world.getBlockState(npos);
+        if (neighbor == null || neighbor.getBlock() != self.getBlock()) return false;
+        // 邻居 bbox：相对方块原点的 0..1 AABB（不是世界坐标）；贴合边取内侧边
+        AxisAlignedBB nb = neighbor.getBoundingBox(ctx.world, npos);
+        double target;
+        switch (face) {
+            case DOWN:  target = -1.0 + nb.maxY; break;
+            case UP:    target = 1.0 + nb.minY; break;
+            case NORTH: target = -1.0 + nb.maxZ; break;
+            case SOUTH: target = 1.0 + nb.minZ; break;
+            case WEST:  target = -1.0 + nb.maxX; break;
+            default:    target = 1.0 + nb.minX; break; // EAST
+        }
+        return Math.abs(first01 - target) < 0.01;
     }
 
     /** 是否草类方块（BetterGrass 判定用） */
