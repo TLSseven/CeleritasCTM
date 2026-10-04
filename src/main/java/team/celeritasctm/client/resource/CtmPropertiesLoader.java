@@ -218,10 +218,6 @@ public class CtmPropertiesLoader {
      * 若其 faces 不含当前面应继续尝试下一条（如 stone8_side 的 sides_ctm 只用于侧面，
      * 顶面应落到 top_bottom 规则）。
      */
-    public static CtmProperties findMatch(String textureName, IBlockState state) {
-        return findMatch(textureName, state, null);
-    }
-
     /**
      * 面感知匹配：返回第一条「纹理+方块+元数据+面」都匹配的规则。
      *
@@ -562,5 +558,4 @@ public class CtmPropertiesLoader {
         loadAll(resourceManager);
     }
 
-    public static boolean isLoaded() { return loaded; }
 }

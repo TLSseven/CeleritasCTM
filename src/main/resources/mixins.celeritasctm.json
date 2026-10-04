@@ -7,7 +7,6 @@
   "client": [
     "MixinBlock",
     "MixinBlockModelShapes",
-    "MixinTextureMap",
     "MixinTextureMapExtended",
     "actinium.MixinChunkBuilderMeshingTask",
     "actinium.MixinWorldProviderSkyColor",

@@ -25,7 +25,6 @@ public class CeleritasCTM {
 
     public static final String MOD_ID = "celeritasctm";
     public static final String MOD_NAME = "CeleritasCTM";
-    public static final String DOMAIN = MOD_ID;
     public static final String VERSION = "1.0.0";
 
     public static final org.apache.logging.log4j.Logger logger =
