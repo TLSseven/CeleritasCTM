@@ -23,6 +23,9 @@ public class MixinBlock {
         CtmBakedModel.RenderContext ctx = ctm$ctx.get();
         ctx.world = world;
         ctx.pos = pos;
+        // 记录注入时的坐标值（不复制对象、不分配）：chunk 构建线程会复用
+        // MutableBlockPos，若下游读取时坐标已被移动，消费端据此判定上下文失效。
+        ctx.packedPos = pos == null ? Long.MIN_VALUE : pos.toLong();
         CtmBakedModel.CURRENT_CONTEXT.set(ctx);
     }
 }

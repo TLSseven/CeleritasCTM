@@ -18,6 +18,8 @@ public class CtmProperties implements Comparable<CtmProperties> {
     private final List<String> matchTiles = new ArrayList<>();
     private final List<String> matchTilesClean = new ArrayList<>();
     private final List<String> matchBlocks = new ArrayList<>();
+    // matchBlocks 的规范化结果（数字 ID 解析为注册名后也放这里；可与 matchBlocks 数量不一致）
+    private final List<CtmRuleSupport.BlockMatch> blockMatches = new ArrayList<>();
     private final List<String> connectTiles = new ArrayList<>();
 
     // tiles - 纹理索引（支持数字、范围、名称；null 表示 <skip>/<default>）
@@ -59,6 +61,8 @@ public class CtmProperties implements Comparable<CtmProperties> {
     public List<String> getMatchTiles() { return matchTiles; }
     public List<String> getMatchTilesClean() { return matchTilesClean; }
     public List<String> getMatchBlocks() { return matchBlocks; }
+    /** matchBlocks 的规范化条目（含数字 ID 解析结果与状态谓词） */
+    public List<CtmRuleSupport.BlockMatch> getBlockMatches() { return blockMatches; }
     public List<String> getConnectTiles() { return connectTiles; }
     public String getTiles() { return tiles; }
     public int getTileCount() { return tileTokens == null ? 1 : tileTokens.length; }
@@ -97,7 +101,38 @@ public class CtmProperties implements Comparable<CtmProperties> {
 
     public void addMatchBlock(String block) {
         if (block == null || block.isEmpty()) return;
-        matchBlocks.add(block);
+        String token = block.trim();
+        if (token.isEmpty()) return;
+        matchBlocks.add(token);
+        CtmRuleSupport.BlockMatch parsed = CtmRuleSupport.parseMatchToken(token);
+        if (parsed != null) blockMatches.add(parsed);
+    }
+
+    /**
+     * 只登记原始 {@code matchBlocks} 文本，<b>不做</b>归一化。
+     * 归一化条目由调用方通过 {@link #addBlockMatch} 单独加入（数字 ID 需要注册表解析，
+     * 必须由加载器负责），避免同一 token 被解析两次产生重复条目。
+     */
+    public void addMatchBlockRecord(String block) {
+        if (block == null) return;
+        String token = block.trim();
+        if (!token.isEmpty()) matchBlocks.add(token);
+    }
+
+    /** 直接加入已规范化的匹配条目（数字 ID 由加载器查注册表解析后使用） */
+    public void addBlockMatch(CtmRuleSupport.BlockMatch match) {
+        if (match == null) return;
+        blockMatches.add(match);
+    }
+
+    /** 是否没有任何可用的方块匹配条目 */
+    public boolean hasBlockMatches() {
+        return !blockMatches.isEmpty();
+    }
+
+    /** 规则是否可参与匹配（有 matchTiles 或有可解析的 matchBlocks） */
+    public boolean hasAnyMatch() {
+        return !matchTilesClean.isEmpty() || !blockMatches.isEmpty();
     }
 
     public void addConnectTile(String tile) {
@@ -135,26 +170,58 @@ public class CtmProperties implements Comparable<CtmProperties> {
 
     /**
      * 方块匹配：matchBlocks 为空时匹配任意方块；
-     * 否则要求方块注册名（含/不含命名空间）与任一 matchBlocks 条目一致。
+     * 否则要求「规范化方块键相同」且「状态谓词全部满足」。
+     *
+     * <p>键比较统一走 {@link CtmRuleSupport#canonicalBlockKey}，与索引构建同一函数，
+     * 不再有“索引拼 {@code minecraft:} 前缀、匹配端比短名”的两条路径。
      */
     public boolean matchesBlock(net.minecraft.block.state.IBlockState state) {
-        if (matchBlocks.isEmpty() || state == null) return true;
-        net.minecraft.block.Block block = state.getBlock();
-        String name = null;
-        try {
-            ResourceLocation rl = block.getRegistryName();
-            name = rl == null ? null : rl.toString();
-        } catch (Throwable t) {
-            name = null;
-        }
-        if (name == null) return false;
-        String nameShort = name.contains(":") ? name.substring(name.indexOf(':') + 1) : name;
-        for (String mb : matchBlocks) {
-            if (mb.equals(name)) return true;
-            String mbShort = mb.contains(":") ? mb.substring(mb.indexOf(':') + 1) : mb;
-            if (mbShort.equals(nameShort)) return true;
+        if (blockMatches.isEmpty() || state == null) return true;
+        String key = canonicalKeyOf(state);
+        if (key == null) return false;
+        Map<String, String> props = statePropertyMap(state);
+        for (CtmRuleSupport.BlockMatch m : blockMatches) {
+            if (m.isNumeric()) continue; // 数字 ID 在加载期已解析为键，未解析成功的条目不参与
+            if (!m.matchesKey(key)) continue;
+            if (m.matchesProperties(props)) return true;
+            // 属性名在方块状态里根本不存在 → 大概率是规则写错了，warn 一次便于定位
+            for (String propName : m.getProperties().keySet()) {
+                if (!props.containsKey(propName)) {
+                    CtmRuleSupport.warnUnknownProperty(key, propName);
+                }
+            }
         }
         return false;
+    }
+
+    /** 方块状态的规范化注册键（{@code namespace:path}，小写） */
+    public static String canonicalKeyOf(net.minecraft.block.state.IBlockState state) {
+        if (state == null) return null;
+        try {
+            net.minecraft.block.Block block = state.getBlock();
+            if (block == null) return null;
+            ResourceLocation rl = block.getRegistryName();
+            if (rl == null) return null;
+            return CtmRuleSupport.canonicalBlockKey(rl.toString());
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 方块状态属性 → 字符串值（谓词比较用） */
+    public static Map<String, String> statePropertyMap(net.minecraft.block.state.IBlockState state) {
+        if (state == null) return Collections.emptyMap();
+        Map<String, String> out = new HashMap<>();
+        try {
+            for (Map.Entry<net.minecraft.block.properties.IProperty<?>, Comparable<?>> e
+                    : state.getProperties().entrySet()) {
+                out.put(e.getKey().getName().toLowerCase(Locale.ROOT),
+                    String.valueOf(e.getValue()));
+            }
+        } catch (Throwable ignored) {
+            return Collections.emptyMap();
+        }
+        return out;
     }
 
     /**

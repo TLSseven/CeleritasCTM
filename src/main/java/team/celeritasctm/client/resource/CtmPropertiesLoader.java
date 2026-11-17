@@ -1,9 +1,9 @@
 package team.celeritasctm.client.resource;
 
-import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.resources.*;
-import net.minecraft.util.EnumFacing;
+import net.minecraft.client.resources.IResource;
+import net.minecraft.client.resources.IResourceManager;
+import net.minecraft.client.resources.ResourcePackRepository;
 import net.minecraft.util.ResourceLocation;
 import team.celeritasctm.CeleritasCTM;
 
@@ -14,72 +14,104 @@ import java.util.zip.ZipFile;
 
 /**
  * 从资源包中加载OptiFine格式的CTM .properties文件
- * 
+ *
  * 搜索路径:
  * - assets/&lt;namespace&gt;/mcpatcher/ctm/ 下的所有子目录中的 .properties
  * - assets/&lt;namespace&gt;/optifine/ctm/ 下的所有子目录中的 .properties
+ *
+ * <h3>优先级来源（实证，不预设方向）</h3>
+ * 1.12.2 的 {@code FallbackResourceManager#getResource} 从 {@code resourcePacks} 列表<b>末尾往前</b>
+ * 查找，命中即返回；而 {@code Minecraft#refreshResources} 按
+ * 「内置包 → {@code getRepositoryEntries()} 顺序 → 服务器包」追加到该列表。
+ * 因此：
+ * <ul>
+ *   <li>{@code getRepositoryEntries()} 的<b>索引越大优先级越高</b>；</li>
+ *   <li>mod 自带资源（经 Forge 加入 {@code defaultResourcePacks}）优先级<b>低于</b>任何用户资源包。</li>
+ * </ul>
+ * 加载时还会用 {@code IResourceManager#getResource} 对同一 resourceId 的实际生效包名做一次校验，
+ * 不一致时以资源管理器结果为准（见 {@link #effectivePackName}），避免仅凭推算。
+ *
+ * <h3>零启用包（A10）</h3>
+ * 仓库可用但启用列表为空时，<b>不扫描</b> {@code resourcepacks/}；mod 自带资源照常加载。
+ * 仅当仓库未就绪（null）时才退化为扫描目录。
  */
 public class CtmPropertiesLoader {
 
     private static final List<CtmProperties> PROPERTIES = new ArrayList<>();
     // 清理后的纹理名 → 属性列表（含 matchTiles 的规则；列表按 packPriority 顺序）
     private static final Map<String, List<CtmProperties>> TILE_INDEX = new HashMap<>();
-    // 方块注册名 → 属性列表（纯 matchBlocks 的规则）
+    // 规范化方块键（namespace:path，小写）→ 属性列表（纯 matchBlocks 的规则）
     private static final Map<String, List<CtmProperties>> BLOCK_INDEX = new HashMap<>();
-    // 已加载的 resourceId（用于跨来源去重：mod jar 与资源包 zip 内容相同）
-    private static final Set<String> SEEN_IDS = new HashSet<>();
+    // 已加载的 resourceId → 实际生效来源的优先级（取最高优先级者）
+    private static final Map<String, Integer> SEEN_IDS = new HashMap<>();
+    // 未知状态属性的 warn 去重
+    private static final Set<String> WARNED_PROPERTIES = new HashSet<>();
+    // 本次扫描涉及的所有包名（用于判定“实际生效来源是否是另一个已知候选包”）
+    private static final Set<String> CANDIDATE_PACK_NAMES = new HashSet<>();
+    // 当前正在扫描的包名（zip 文件名或文件夹名），供去重时确认实际生效来源
+    private static String currentPackName;
+    // 当前重载使用的资源管理器（仅在重复 resourceId 时用于实证查询）
+    private static IResourceManager activeResourceManager;
     private static boolean loaded = false;
 
     // 内置连接玻璃规则（mod jar 内 tiles 0-46，见 assets/celeritasctm/mcpatcher/ctm/connected_glass/）。
     // 无色玻璃（blocks/glass）经 findMatch 命中；染色玻璃在 CtmBakedModel 手动走此规则。
     public static CtmProperties GLASS_RULE = null;
 
+    /** 一次扫描的来源描述 */
+    private static final class PackSource {
+        final String name;
+        final File file;
+        final int priority;
+
+        PackSource(String name, File file, int priority) {
+            this.name = name;
+            this.file = file;
+            this.priority = priority;
+        }
+    }
+
     public static void loadAll(IResourceManager resourceManager) {
         PROPERTIES.clear();
         TILE_INDEX.clear();
         BLOCK_INDEX.clear();
         SEEN_IDS.clear();
+        WARNED_PROPERTIES.clear();
+        CANDIDATE_PACK_NAMES.clear();
+        currentPackName = null;
+        activeResourceManager = resourceManager;
+        CtmRuleSupport.setWarnSink(CtmPropertiesLoader::warnOnceForProperty);
         CeleritasCTM.logger.info("=== CTM Properties Loader: Scanning resource packs ===");
 
         int totalLoaded = 0;
 
         try {
-            // 只扫描已启用的资源包（禁用包的 CTM 内容不应加载）
-            Set<String> enabledPacks = getEnabledPackNames();
-
-            // 方法1: 直接扫描resourcepacks目录（最可靠）
-            File resourcepacksDir = new File(Minecraft.getMinecraft().gameDir, "resourcepacks");
-            if (resourcepacksDir.isDirectory()) {
-                int packPriority = 0;
-                File[] files = resourcepacksDir.listFiles();
-                if (files != null) {
-                    for (File file : files) {
-                        String name = file.getName();
-                        // 包名匹配：zip 文件名或文件夹名
-                        if (!enabledPacks.isEmpty() && !enabledPacks.contains(name)) {
-                            continue;
-                        }
-                        if (file.isFile() && file.getName().endsWith(".zip")) {
-                            totalLoaded += scanZipFile(file, packPriority);
-                            packPriority++;
-                        } else if (file.isDirectory()) {
-                            totalLoaded += scanDirectory(file, packPriority);
-                            packPriority++;
-                        }
-                    }
+            List<PackSource> sources = collectPackSources();
+            List<String> scanned = new ArrayList<>();
+            for (PackSource source : sources) {
+                scanned.add(source.name + "@" + source.priority);
+                CANDIDATE_PACK_NAMES.add(source.name);
+                CANDIDATE_PACK_NAMES.add(source.file.getName());
+                if (source.file.isFile() && source.file.getName().endsWith(".zip")) {
+                    totalLoaded += scanZipFile(source.file, source.priority);
+                } else if (source.file.isDirectory()) {
+                    totalLoaded += scanDirectory(source.file, source.priority);
                 }
+                currentPackName = null;
             }
+            CeleritasCTM.logger.info("CTM: scanned packs (low→high priority): {}", scanned);
 
-            // 方法2: 也扫描mods目录（某些mod自带CTM资源）
+            // mods 目录：mod 自带资源（Forge 将其排在用户包之前，故优先级更低）
             File modsDir = new File(Minecraft.getMinecraft().gameDir, "mods");
             if (modsDir.isDirectory()) {
                 File[] modFiles = modsDir.listFiles();
                 if (modFiles != null) {
-                    int packPriority = totalLoaded > 0 ? 1000 : 0;
+                    int modIndex = 0;
                     for (File file : modFiles) {
                         if (file.isFile() && (file.getName().endsWith(".jar") || file.getName().endsWith(".zip"))) {
-                            totalLoaded += scanZipFile(file, packPriority);
-                            packPriority++;
+                            CANDIDATE_PACK_NAMES.add(file.getName());
+                            totalLoaded += scanZipFile(file, CtmRuleSupport.modPackPriority(modIndex));
+                            modIndex++;
                         }
                     }
                 }
@@ -95,6 +127,130 @@ public class CtmPropertiesLoader {
         injectVanillaIronBarsPatch();
         injectVanillaGlassPatch();
         CeleritasCTM.logger.info("=== CTM Properties Loader: Total {} CTM properties loaded ===", totalLoaded);
+    }
+
+    /**
+     * 收集要扫描的包来源。
+     *
+     * <p>优先级：
+     * <ul>
+     *   <li>仓库就绪：按 {@code getRepositoryEntries()} 顺序，索引即优先级（越大越优先）；</li>
+     *   <li>仓库就绪且列表为空：<b>零用户包</b>，资源包目录一个都不扫（A10），只留 mod 资源；</li>
+     *   <li>仓库未就绪：退化扫描 {@code resourcepacks/}，按文件名字母序，并 warn。</li>
+     * </ul>
+     * {@code listFiles()} 只用于把启用包名映射到文件，不参与排序。
+     */
+    private static List<PackSource> collectPackSources() {
+        List<PackSource> out = new ArrayList<>();
+        File resourcepacksDir = new File(Minecraft.getMinecraft().gameDir, "resourcepacks");
+
+        ResourcePackRepository repo = null;
+        try {
+            repo = Minecraft.getMinecraft().getResourcePackRepository();
+        } catch (Throwable t) {
+            repo = null;
+        }
+
+        if (repo == null) {
+            // 仓库未就绪：退化路径（无法判断启用栈，只能尽力而为）
+            CeleritasCTM.logger.warn(
+                "CTM: ResourcePackRepository not ready - falling back to scanning resourcepacks/ (priority order unspecified)");
+            out.addAll(scanAllResourcepacks(resourcepacksDir));
+            return out;
+        }
+
+        List<ResourcePackRepository.Entry> entries;
+        try {
+            entries = repo.getRepositoryEntries();
+        } catch (Throwable t) {
+            CeleritasCTM.logger.warn("CTM: failed to read enabled resource pack stack: {}", t.toString());
+            entries = Collections.emptyList();
+        }
+
+        if (entries == null || entries.isEmpty()) {
+            // 零启用：不扫描 resourcepacks/（A10）。mod 自带资源仍会加载。
+            CeleritasCTM.logger.info("CTM: no user resource packs enabled - resourcepacks/ will not be scanned");
+            return out;
+        }
+
+        Map<String, File> byName = indexResourcepackFiles(resourcepacksDir);
+        List<String> enabledNames = new ArrayList<>();
+        for (int i = 0; i < entries.size(); i++) {
+            String packName;
+            try {
+                packName = entries.get(i).getResourcePackName();
+            } catch (Throwable t) {
+                continue;
+            }
+            if (packName == null) continue;
+            enabledNames.add(packName);
+        }
+
+        List<CtmRuleSupport.PackSourceInfo> stack =
+            CtmRuleSupport.priorityForEnabledStack(enabledNames);
+        for (CtmRuleSupport.PackSourceInfo info : stack) {
+            String packName = info.name;
+            File file = byName.get(packName);
+            if (file == null) file = byName.get(packName + ".zip");
+            if (file == null) {
+                CeleritasCTM.logger.warn(
+                    "CTM: enabled pack '{}' not found under resourcepacks/ (ignored)", packName);
+                continue;
+            }
+            out.add(new PackSource(packName, file, info.priority));
+        }
+        CeleritasCTM.logger.info("CTM: enabled packs (low→high priority): {}", enabledNames);
+        return out;
+    }
+
+    /** 仅用于发现文件（不参与优先级）；键为文件名与去掉 .zip 的名字 */
+    private static Map<String, File> indexResourcepackFiles(File dir) {
+        Map<String, File> map = new HashMap<>();
+        if (dir == null || !dir.isDirectory()) return map;
+        File[] files = dir.listFiles();
+        if (files == null) return map;
+        for (File file : files) {
+            String name = file.getName();
+            map.put(name, file);
+            if (name.toLowerCase(Locale.ROOT).endsWith(".zip")) {
+                map.put(name.substring(0, name.length() - 4), file);
+            }
+        }
+        return map;
+    }
+
+    /** 仓库未就绪时的退化扫描：文件名字母序，优先级按索引递增（可能不正确，仅尽力而为） */
+    private static List<PackSource> scanAllResourcepacks(File dir) {
+        List<PackSource> out = new ArrayList<>();
+        if (dir == null || !dir.isDirectory()) return out;
+        File[] files = dir.listFiles();
+        if (files == null) return out;
+        Arrays.sort(files, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+        int i = 0;
+        for (File file : files) {
+            if (file.isFile() && file.getName().endsWith(".zip")) {
+                out.add(new PackSource(file.getName(), file, CtmRuleSupport.userPackPriority(i++)));
+            } else if (file.isDirectory()) {
+                out.add(new PackSource(file.getName(), file, CtmRuleSupport.userPackPriority(i++)));
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 用资源管理器确认某个 resourceId 的<b>实际生效包名</b>；无法确认时返回 null。
+     * 资源管理器从包列表末尾往前找（1.12.2 {@code FallbackResourceManager}），
+     * 因此这里返回的就是最终覆盖来源。
+     */
+    private static String effectivePackName(IResourceManager resourceManager, ResourceLocation resourceId) {
+        if (resourceManager == null || resourceId == null) return null;
+        try {
+            IResource resource = resourceManager.getResource(resourceId);
+            return resource == null ? null : resource.getResourcePackName();
+        } catch (Throwable t) {
+            // 未找到 / 命名空间不存在 / 管理器尚未就绪：不据此否决任何规则
+            return null;
+        }
     }
 
     /**
@@ -153,24 +309,7 @@ public class CtmPropertiesLoader {
         }
     }
 
-    /** 获取已启用的资源包名称集合（zip 文件名或文件夹名） */
-    private static Set<String> getEnabledPackNames() {
-        Set<String> names = new HashSet<>();
-        try {
-            Minecraft mc = Minecraft.getMinecraft();
-            if (mc != null && mc.getResourcePackRepository() != null) {
-                for (net.minecraft.client.resources.ResourcePackRepository.Entry entry :
-                        mc.getResourcePackRepository().getRepositoryEntries()) {
-                    names.add(entry.getResourcePackName());
-                }
-            }
-        } catch (Throwable t) {
-            // 仓库未就绪时返回空集合，调用方将扫描全部（回退）
-        }
-        return names;
-    }
-
-    /** 构建双索引：纹理名 → 规则列表（含 matchTiles），方块注册名 → 规则列表（纯 matchBlocks） */
+    /** 构建双索引：纹理名 → 规则列表（含 matchTiles），规范化方块键 → 规则列表（纯 matchBlocks） */
     private static void rebuildIndex() {
         TILE_INDEX.clear();
         BLOCK_INDEX.clear();
@@ -180,18 +319,18 @@ public class CtmPropertiesLoader {
                 for (String clean : prop.getMatchTilesClean()) {
                     TILE_INDEX.computeIfAbsent(clean, k -> new ArrayList<>()).add(prop);
                 }
-            } else if (!prop.getMatchBlocks().isEmpty()) {
-                for (String mb : prop.getMatchBlocks()) {
-                    String key = mb.contains(":") ? mb : "minecraft:" + mb;
-                    BLOCK_INDEX.computeIfAbsent(key, k -> new ArrayList<>()).add(prop);
+            } else if (prop.hasBlockMatches()) {
+                for (CtmRuleSupport.BlockMatch match : prop.getBlockMatches()) {
+                    if (match.isNumeric() || match.getKey() == null) continue;
+                    BLOCK_INDEX.computeIfAbsent(match.getKey(), k -> new ArrayList<>()).add(prop);
                 }
             }
         }
     }
 
     /**
-     * 添加属性：按 resourceId 去重（保留首个/最高优先级来源），
-     * 并跳过完全无法匹配的属性（无 matchTiles 也无 matchBlocks）。
+     * 添加属性：按 resourceId 去重，保留<b>优先级最高</b>的来源（不是先到先得），
+     * 并跳过完全无法匹配的属性（无 matchTiles 也无可用 matchBlocks）。
      * method=overlay* 的连接过渡规则：本 mod 已移除 overlay 功能（CUTOUT 二次渲染），
      * 直接跳过，避免其 17 张 tile 被当作普通 ctm 规则误用。
      */
@@ -200,9 +339,23 @@ public class CtmPropertiesLoader {
         if (method != null && method.startsWith("overlay")) {
             return false;
         }
+        if (!props.hasAnyMatch()) return false;
         String id = props.getResourceId().toString();
-        if (!SEEN_IDS.add(id)) return false;
-        if (props.getMatchTilesClean().isEmpty() && props.getMatchBlocks().isEmpty()) return false;
+        Integer existing = SEEN_IDS.get(id);
+        if (existing != null) {
+            if (!CtmRuleSupport.shouldReplace(existing, props.getPackPriority())) {
+                return false; // 已有更高或同优先级的来源
+            }
+            // 只在重复 resourceId 时做一次实证：以资源管理器报告的生效包名为准
+            if (isShadowedByEffectiveSource(props, existing)) {
+                return false;
+            }
+            // 新来源优先级更高：移除旧规则
+            for (Iterator<CtmProperties> it = PROPERTIES.iterator(); it.hasNext(); ) {
+                if (id.equals(it.next().getResourceId().toString())) it.remove();
+            }
+        }
+        SEEN_IDS.put(id, props.getPackPriority());
         // 有 matchTiles 的规则视为 tile-based（OptiFine 默认 connect=tile）
         props.setTileBased(!props.getMatchTilesClean().isEmpty());
         PROPERTIES.add(props);
@@ -210,14 +363,21 @@ public class CtmPropertiesLoader {
     }
 
     /**
-     * 匹配规则（按优先级顺序）：
-     * 1. 含 matchTiles 的规则：纹理名命中，且方块/元数据（若指定）匹配
-     * 2. 纯 matchBlocks 的规则：方块注册名命中，且元数据（若指定）匹配
-     *
-     * 注意：OptiFine 遍历规则直到找到能应用于当前面的规则，不能只返回第一个匹配——
-     * 若其 faces 不含当前面应继续尝试下一条（如 stone8_side 的 sides_ctm 只用于侧面，
-     * 顶面应落到 top_bottom 规则）。
+     * 仅在重复 resourceId 时调用：向资源管理器确认该文件的实际生效包，
+     * 若生效包是另一个已知候选包则说明当前来源被覆盖，不应替换。
+     * 查询失败或包名无法对应时返回 false（保守：不否决优先级推算）。
      */
+    private static boolean isShadowedByEffectiveSource(CtmProperties props, int existingPriority) {
+        String effective = effectivePackName(activeResourceManager, props.getResourceId());
+        if (!CtmRuleSupport.isOverriddenByAnotherKnownPack(effective, currentPackName, CANDIDATE_PACK_NAMES)) {
+            return false;
+        }
+        CeleritasCTM.logger.info(
+            "CTM: {} has override '{}' which is not the high-priority source; keeping existing rule",
+            props.getResourceId(), effective);
+        return true;
+    }
+
     /**
      * 面感知匹配：返回第一条「纹理+方块+元数据+面」都匹配的规则。
      *
@@ -228,11 +388,14 @@ public class CtmPropertiesLoader {
      * （unculled 面进入 general quads 时 getQuads 的 side 参数为 null，
      * 但 quad 元素面的真实朝向保存在 BakedQuad.getFace() 中）。
      */
-    public static CtmProperties findMatch(String textureName, IBlockState state, EnumFacing side) {
+    public static CtmProperties findMatch(String textureName, net.minecraft.block.state.IBlockState state,
+                                          net.minecraft.util.EnumFacing side) {
         return findMatchInternal(textureName, state, side);
     }
 
-    private static CtmProperties findMatchInternal(String textureName, IBlockState state, EnumFacing side) {
+    private static CtmProperties findMatchInternal(String textureName,
+                                                   net.minecraft.block.state.IBlockState state,
+                                                   net.minecraft.util.EnumFacing side) {
         // 1) matchTiles 规则
         if (textureName != null) {
             List<CtmProperties> list = TILE_INDEX.get(CtmProperties.cleanTextureName(textureName));
@@ -244,23 +407,18 @@ public class CtmPropertiesLoader {
                 }
             }
         }
-        // 2) matchBlocks 规则（无 matchTiles 时按方块匹配）
+        // 2) matchBlocks 规则（无 matchTiles 时按规范化方块键匹配）
         if (state != null) {
-            net.minecraft.block.Block block = state.getBlock();
-            if (block != null) {
-                try {
-                    ResourceLocation rl = block.getRegistryName();
-                    if (rl != null) {
-                        List<CtmProperties> list = BLOCK_INDEX.get(rl.toString());
-                        if (list != null) {
-                            for (CtmProperties p : list) {
-                                if (p.matchesMetadata(state) && p.appliesTo(side)) {
-                                    return p;
-                                }
-                            }
+            String key = CtmProperties.canonicalKeyOf(state);
+            if (key != null) {
+                List<CtmProperties> list = BLOCK_INDEX.get(key);
+                if (list != null) {
+                    for (CtmProperties p : list) {
+                        if (p.matchesBlock(state) && p.matchesMetadata(state) && p.appliesTo(side)) {
+                            return p;
                         }
                     }
-                } catch (Throwable ignored) {}
+                }
             }
         }
         return null;
@@ -276,7 +434,7 @@ public class CtmPropertiesLoader {
 
                 if (!name.endsWith(".properties")) continue;
 
-                String ctmPath = null;
+                String ctmPath;
                 if (name.contains("mcpatcher/ctm/")) {
                     ctmPath = "mcpatcher/ctm";
                 } else if (name.contains("optifine/ctm/")) {
@@ -296,6 +454,7 @@ public class CtmPropertiesLoader {
                     int ctmIdx = name.indexOf(ctmPath);
                     String resourcePath = name.substring(ctmIdx);
                     ResourceLocation resourceId = new ResourceLocation(namespace, resourcePath);
+                    currentPackName = zipFile.getName();
                     CtmProperties props = parseProperties(is, resourceId, packPriority);
                     if (props != null && addProperty(props)) {
                         count++;
@@ -320,7 +479,7 @@ public class CtmPropertiesLoader {
                     for (String ctmPath : new String[] { "mcpatcher/ctm", "optifine/ctm" }) {
                         File ctmDir = new File(namespaceDir, ctmPath);
                         if (ctmDir.isDirectory()) {
-                            count += scanPropertiesDir(ctmDir, namespace, ctmPath, packPriority);
+                            count += scanPropertiesDir(ctmDir, namespace, ctmPath, packPriority, dir.getName());
                         }
                     }
                 }
@@ -329,14 +488,15 @@ public class CtmPropertiesLoader {
         return count;
     }
 
-    private static int scanPropertiesDir(File dir, String namespace, String ctmPath, int packPriority) {
+    private static int scanPropertiesDir(File dir, String namespace, String ctmPath, int packPriority,
+                                         String packName) {
         int count = 0;
         File[] files = dir.listFiles();
         if (files == null) return 0;
 
         for (File file : files) {
             if (file.isDirectory()) {
-                count += scanPropertiesDir(file, namespace, ctmPath, packPriority);
+                count += scanPropertiesDir(file, namespace, ctmPath, packPriority, packName);
             } else if (file.getName().endsWith(".properties")) {
                 try (FileInputStream fis = new FileInputStream(file)) {
                     String relativePath = file.getAbsolutePath().replace('\\', '/');
@@ -344,6 +504,7 @@ public class CtmPropertiesLoader {
                     if (idx >= 0) {
                         String resourcePath = relativePath.substring(idx);
                         ResourceLocation resourceId = new ResourceLocation(namespace, resourcePath);
+                        currentPackName = packName;
                         CtmProperties props = parseProperties(fis, resourceId, packPriority);
                         if (props != null && addProperty(props)) {
                             count++;
@@ -358,15 +519,16 @@ public class CtmPropertiesLoader {
     }
 
     /**
-     * 解析单个.properties文件
+     * 解析单个.properties文件。返回 null 表示该规则应被跳过（坏 metadata / 坏 connect /
+     * 无可用匹配目标），调用方会把 null 视为“不加载”。
      */
     public static CtmProperties parseProperties(InputStream stream, ResourceLocation resourceId,
-                                                  int packPriority) {
+                                                 int packPriority) {
         try {
             Properties props = new Properties();
             props.load(stream);
 
-            String method = props.getProperty("method", "ctm").trim().toLowerCase();
+            String method = props.getProperty("method", "ctm").trim().toLowerCase(Locale.ROOT);
             CtmProperties ctm = new CtmProperties(resourceId, method, packPriority);
 
             // matchTiles（支持相对路径 ./xxx.png，基于 properties 所在目录解析）
@@ -386,18 +548,41 @@ public class CtmPropertiesLoader {
                 }
             }
 
-            // matchBlocks
+            // matchBlocks：统一走 CtmRuleSupport 归一化（数字 ID / 短名 / ns:name / ns:name:prop=value）
             String matchBlocksRaw = props.getProperty("matchBlocks", "");
             if (!matchBlocksRaw.isEmpty()) {
-                for (String block : matchBlocksRaw.split("\\s+")) {
-                    ctm.addMatchBlock(block.trim());
+                boolean anyValidToken = false;
+                for (String token : matchBlocksRaw.split("\\s+")) {
+                    String t = token.trim();
+                    if (t.isEmpty()) continue;
+                    CtmRuleSupport.BlockMatch parsed = CtmRuleSupport.parseMatchToken(t);
+                    if (parsed == null) {
+                        CeleritasCTM.logger.warn("CTM: {} has invalid matchBlocks entry '{}' (ignored)",
+                            resourceId, t);
+                        continue;
+                    }
+                    if (parsed.isNumeric()) {
+                        CtmRuleSupport.BlockMatch resolved = resolveNumericId(resourceId, parsed);
+                        if (resolved == null) continue; // 已在 resolveNumericId 内 warn
+                        ctm.addMatchBlockRecord(resolved.getKey());
+                        ctm.addBlockMatch(resolved);
+                    } else {
+                        ctm.addMatchBlockRecord(t);
+                        ctm.addBlockMatch(parsed);
+                    }
+                    anyValidToken = true;
+                }
+                if (!anyValidToken && ctm.getMatchTilesClean().isEmpty()) {
+                    CeleritasCTM.logger.warn("CTM: {} has no usable matchBlocks entries - rule skipped",
+                        resourceId);
+                    return null;
                 }
             }
 
             // OptiFine block<ID> 文件名机制：matchTiles/matchBlocks 都为空时，
             // 若文件名是 block<数字>[后缀]（如 block171a.properties），自动匹配方块 ID。
             // Conquest 的地毯规则（block171*.properties）依赖此机制。
-            if (ctm.getMatchTilesClean().isEmpty() && ctm.getMatchBlocks().isEmpty()) {
+            if (ctm.getMatchTilesClean().isEmpty() && !ctm.hasBlockMatches()) {
                 addBlockIdMatch(ctm);
             }
 
@@ -407,21 +592,25 @@ public class CtmPropertiesLoader {
                 ctm.setTiles(tilesRaw.trim());
             }
 
-            // faces（OptiFine 支持 faces= 与 sides= 两个键，如 Conquest 的 "sides=top bottom"；
-            // faces=all 或无 faces 视为无面限制——含无朝向 quad）
-            String facesRaw = props.getProperty("faces", "all").trim().toLowerCase();
-            String sidesRaw = props.getProperty("sides", "").trim().toLowerCase();
-            if (sidesRaw.isEmpty() || "all".equals(facesRaw)) {
-                parseFaces(ctm, facesRaw);
-            } else {
-                parseFaces(ctm, facesRaw + " " + sidesRaw);
-            }
+            // faces / sides：
+            // - sides 单独出现时取代默认 faces=all（A11）
+            // - faces 与 sides 同时出现时取并集
+            // - sides 不是 OptiFine 标准属性，仅为 Conquest 等扩展包兼容
+            Set<String> faces = CtmRuleSupport.resolveFaces(
+                props.getProperty("faces"), props.getProperty("sides"));
+            for (String face : faces) ctm.addFace(face);
 
-            // metadata（支持列表与范围，如 "1 5 9"、"0-5"、"0 2-4 8"；默认 -1 表示所有）
+            // metadata（支持列表与范围，如 "1 5 9"、"0-5"；默认 -1 表示所有）
             String metadataRaw = props.getProperty("metadata", "-1").trim();
             if (!metadataRaw.isEmpty() && !"-1".equals(metadataRaw)) {
-                int[] meta = parseMetadata(metadataRaw);
-                if (meta != null) ctm.setMetadata(meta);
+                int[] meta = CtmRuleSupport.parseMetadata(metadataRaw);
+                if (meta == null) {
+                    // fail-closed：坏 metadata 不得放宽为“全部匹配”
+                    CeleritasCTM.logger.warn("CTM: {} has invalid metadata '{}' - rule skipped",
+                        resourceId, metadataRaw);
+                    return null;
+                }
+                ctm.setMetadata(meta);
             }
 
             // weights
@@ -439,8 +628,14 @@ public class CtmPropertiesLoader {
             try { ctm.setWidth(Integer.parseInt(props.getProperty("width", "1").trim())); } catch (NumberFormatException ignored) {}
             try { ctm.setHeight(Integer.parseInt(props.getProperty("height", "1").trim())); } catch (NumberFormatException ignored) {}
 
-            // connect
-            ctm.setConnect(props.getProperty("connect", "").trim());
+            // connect（合法值 block|tile|material|state；其余 fail-closed）
+            String connectRaw = props.getProperty("connect", "").trim();
+            if (!CtmRuleSupport.isValidConnect(connectRaw)) {
+                CeleritasCTM.logger.warn("CTM: {} has unknown connect value '{}' - rule skipped",
+                    resourceId, connectRaw);
+                return null;
+            }
+            ctm.setConnect(connectRaw);
 
             // symmetry（random/repeat 的面对称性）
             ctm.setSymmetry(props.getProperty("symmetry", "none").trim());
@@ -461,9 +656,34 @@ public class CtmPropertiesLoader {
     }
 
     /**
-     * 解析 metadata 列表：支持单个值、空格分隔列表、范围（0-5）与混合。
-     * 返回 null 表示解析失败（不设置）。
+     * 数字 Block ID 归一化：OptiFine 1.12.2 文档 {@code doc/ctm.properties:47}
+     * 规定 {@code matchBlocks=<list of block IDs 0-4095>}。
+     * 解析失败（返回 null 或注册名为 null）时 warn 并跳过该条，不得静默当成方块名。
      */
+    private static CtmRuleSupport.BlockMatch resolveNumericId(ResourceLocation resourceId,
+                                                              CtmRuleSupport.BlockMatch numeric) {
+        int id = numeric.getNumericId();
+        try {
+            net.minecraft.block.Block block = net.minecraft.block.Block.getBlockById(id);
+            if (block == null) {
+                CeleritasCTM.logger.warn("CTM: {} matchBlocks id {} resolves to no block (ignored)",
+                    resourceId, id);
+                return null;
+            }
+            ResourceLocation rl = block.getRegistryName();
+            if (rl == null) {
+                CeleritasCTM.logger.warn("CTM: {} matchBlocks id {} has no registry name (ignored)",
+                    resourceId, id);
+                return null;
+            }
+            return numeric.resolvedTo(rl.toString());
+        } catch (Throwable t) {
+            CeleritasCTM.logger.warn("CTM: {} failed to resolve matchBlocks id {}: {}",
+                resourceId, id, t.toString());
+            return null;
+        }
+    }
+
     /**
      * OptiFine block(数字ID) 文件名机制：规则文件名形如 block171a.properties
      * （匹配 ID=171 的方块 minecraft:carpet）时，通过 Block.getBlockById
@@ -475,7 +695,6 @@ public class CtmPropertiesLoader {
         int lastSlash = fileName.lastIndexOf('/');
         String base = lastSlash >= 0 ? fileName.substring(lastSlash + 1) : fileName;
         if (!base.startsWith("block")) return;
-        // 提取 block 后的数字前缀
         int digitStart = 5;
         int i = digitStart;
         while (i < base.length() && Character.isDigit(base.charAt(i))) i++;
@@ -483,70 +702,25 @@ public class CtmPropertiesLoader {
         try {
             int blockId = Integer.parseInt(base.substring(digitStart, i));
             net.minecraft.block.Block block = net.minecraft.block.Block.getBlockById(blockId);
-            if (block == null) return;
+            if (block == null) {
+                CeleritasCTM.logger.warn("CTM: {} filename implies block id {} but no such block",
+                    ctm.getResourceId(), blockId);
+                return;
+            }
             net.minecraft.util.ResourceLocation rl = block.getRegistryName();
             if (rl == null) return;
             ctm.addMatchBlock(rl.toString());
-        } catch (NumberFormatException ignored) {}
+        } catch (NumberFormatException ignored) {
+        }
     }
 
-    /**
-     * 解析 metadata 列表：支持单个值、空格分隔列表、范围（0-5）与混合。
-     * 返回 null 表示解析失败（不设置）。
-     */
-    private static int[] parseMetadata(String raw) {
-        java.util.List<Integer> out = new java.util.ArrayList<>();
-        for (String part : raw.split("\\s+")) {
-            part = part.trim();
-            if (part.isEmpty()) continue;
-            int dash = part.indexOf('-');
-            if (dash > 0) {
-                try {
-                    int a = Integer.parseInt(part.substring(0, dash).trim());
-                    int b = Integer.parseInt(part.substring(dash + 1).trim());
-                    if (a > b) { int t = a; a = b; b = t; }
-                    if (b - a < 256) {
-                        for (int i = a; i <= b; i++) out.add(i);
-                        continue;
-                    }
-                } catch (NumberFormatException ignored) {
-                    return null;
-                }
-            }
-            try {
-                out.add(Integer.parseInt(part));
-            } catch (NumberFormatException e) {
-                return null;
-            }
+    /** 同一个未知属性只 warn 一次（跨规则、跨重载去重由 WARNED_PROPERTIES 保证） */
+    private static void warnOnceForProperty(String message) {
+        String key = message;
+        synchronized (WARNED_PROPERTIES) {
+            if (!WARNED_PROPERTIES.add(key)) return;
         }
-        if (out.isEmpty()) return null;
-        int[] arr = new int[out.size()];
-        for (int i = 0; i < arr.length; i++) arr[i] = out.get(i);
-        return arr;
-    }
-
-    private static void parseFaces(CtmProperties ctm, String facesRaw) {
-        // 注意：EnumFacing 的 getName() 是 up/down/north/south/east/west，
-        // OptiFine 文档用 top/bottom，需要归一化。
-        // faces=all 或无 faces：保持 faces 集为空（无面限制，含无朝向 quad）
-        if (facesRaw == null || facesRaw.isEmpty() || "all".equals(facesRaw)) {
-            return;
-        }
-        boolean sidesSeen = false;
-        for (String face : facesRaw.split("\\s+")) {
-            face = face.trim();
-            if (face.isEmpty()) continue;
-            if ("sides".equals(face)) {           // sides 可与其他面组合：如 "sides bottom"（Patrix 圆石）
-                if (sidesSeen) continue;
-                sidesSeen = true;
-                ctm.addFace("north"); ctm.addFace("south");
-                ctm.addFace("east"); ctm.addFace("west");
-            } else {
-                if ("top".equals(face)) face = "up";
-                else if ("bottom".equals(face)) face = "down";
-                ctm.addFace(face);
-            }
-        }
+        CeleritasCTM.logger.warn("CTM: {}", message);
     }
 
     public static List<CtmProperties> getProperties() {

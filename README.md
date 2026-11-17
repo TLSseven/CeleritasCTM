@@ -44,8 +44,8 @@
 | 依赖 | 版本 |
 |---------|---------|
 | Minecraft | 1.12.2 |
-| Cleanroom Loader | 0.6.7+ |
-| Celeritas / Actinium | 2.4.0+ |
+| Cleanroom Loader | 0.6.13-alpha |
+| Actinium | alpha-0.0.13 |
 
 ---
 

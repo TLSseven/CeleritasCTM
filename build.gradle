@@ -41,13 +41,15 @@ base {
     archivesName = propertyString('mod_name')
 }
 
+// Compilation runs on a JDK 25 toolchain because the Cleanroom loader jars are
+// compiled for Java 25 (class file major 69) and cannot be read by older
+// compilers. The produced bytecode stays Java 8 via `options.release = 8`.
+// The concrete JDK location is resolved by the toolchain, never hardcoded.
 java {
-    // 需要引用 Actinium 的 record 类（RenderPassConfiguration），Java 8 无法解析
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
 }
-
-// ========== Repositories ==========
 
 // ========== Repositories ==========
 
@@ -58,10 +60,33 @@ repositories {
     maven { url = 'https://api.modrinth.com/maven' }
     maven { url = 'https://maven.aliyun.com/repository/public' }
     maven { url = 'https://maven.aliyun.com/repository/central' }
-    mavenLocal()
 }
 
 // ========== Dependencies ==========
+
+// Actinium is consumed as a local artifact so the compile classpath always
+// matches the runtime jar. Pass it explicitly:
+//   gradle build -Pactinium_jar="<path to Actinium-alpha-0.0.13.jar>"
+// or set `actinium_jar` in ~/.gradle/gradle.properties (per machine).
+// The expected API level is Actinium alpha-0.0.13.
+//
+// Resolution is lazy so unrelated tasks (e.g. `gradle tasks`) still configure
+// offline; the missing property only fails when something actually needs the
+// artifact, and then with an actionable message.
+def actiniumJarPath = propertyString('actinium_jar')
+def actiniumJarProvider = providers.provider {
+    if (actiniumJarPath.isEmpty()) {
+        throw new GradleException(
+            'Property actinium_jar is required: pass -Pactinium_jar=<path to Actinium-alpha-0.0.13.jar>')
+    }
+    def candidate = file(actiniumJarPath)
+    if (!candidate.isFile()) {
+        throw new GradleException("actinium_jar does not point to a readable jar: ${candidate}")
+    }
+    candidate
+}
+
+def targetActiniumJar = files(actiniumJarProvider)
 
 configurations {
     embed
@@ -76,12 +101,177 @@ dependencies {
     // Mixin - provided by Cleanroom loader at runtime
     compileOnly 'org.spongepowered:mixin:0.8.5'
 
-    // Actinium（Sodium/Celeritas 渲染管线）——编译期引用 VintageBlockRenderer
-    compileOnly files('E:/Opencode/Actinium/build/libs/Actinium-2.4.0-dev.jar')
-    
+    // Actinium (Sodium/Celeritas rendering pipeline) - property-injected jar
+    compileOnly targetActiniumJar
+
     // GTNHLib (optional - for advanced features)
     // modCompileOnly 'com.github.GTNewHorizons:GTNHLib:2.1.17:dev'
 }
+
+// Checks the target Actinium artifact and compiled mixin/config contracts.
+
+def classPool = { byte[] bytes ->
+    def input = new DataInputStream(new ByteArrayInputStream(bytes))
+    if (input.readInt() != -889275714) {
+        throw new GradleException('Invalid Java class file')
+    }
+    input.skipBytes(4)
+    int count = input.readUnsignedShort()
+    def utf8 = new String[count]
+    def classNames = new int[count]
+    for (int i = 1; i < count; i++) {
+        int tag = input.readUnsignedByte()
+        switch (tag) {
+            case 1: utf8[i] = input.readUTF(); break
+            case 3: case 4: input.skipBytes(4); break
+            case 5: case 6: input.skipBytes(8); i++; break
+            case 7: classNames[i] = input.readUnsignedShort(); break
+            case 8: case 16: case 19: case 20: input.skipBytes(2); break
+            case 9: case 10: case 11: case 12: case 17: case 18: input.skipBytes(4); break
+            case 15: input.skipBytes(3); break
+            default: throw new GradleException("Unknown class-file constant-pool tag ${tag}")
+        }
+    }
+    [utf8: utf8, classes: classNames.findAll { it != 0 }.collect { utf8[it] } as Set]
+}
+
+tasks.register('verifyContracts') {
+    group = 'verification'
+    description = 'Verifies the compile-time contracts against the injected Actinium jar.'
+
+    def mixinConfig = layout.projectDirectory.file('src/main/resources/mixins.celeritasctm.json')
+    def actiniumFile = targetActiniumJar.singleFile
+
+    dependsOn tasks.named('compileJava')
+    inputs.files(sourceSets.main.output.classesDirs)
+    inputs.files(targetActiniumJar)
+    inputs.file(mixinConfig)
+    outputs.upToDateWhen { false }
+
+    doLast {
+        // 1. Namespace contract: the target Actinium artifact must expose the
+        //    embeddium types we compile against, under the `dhj/` namespace.
+        def requiredEntries = [
+            'com/dhj/actinium/render/terrain/compile/task/ChunkBuilderMeshingTask.class',
+            'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildContext.class',
+            'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildOutput.class',
+            'dhj/embeddedt/embeddium/impl/util/task/CancellationToken.class',
+            'dhj/embeddedt/embeddium/api/OptionGUIConstructionEvent.class',
+            'dhj/embeddedt/embeddium/api/options/structure/OptionPage.class',
+            'dhj/embeddedt/embeddium/api/options/structure/OptionStorage.class',
+            'dhj/embeddedt/embeddium/api/options/structure/OptionImpl.class',
+            'dhj/embeddedt/embeddium/api/options/control/TickBoxControl.class',
+        ]
+        new java.util.zip.ZipFile(actiniumFile).withCloseable { zip ->
+            def names = java.util.Collections.list(zip.entries()).collect { it.name } as Set
+            requiredEntries.each { entry ->
+                if (!names.contains(entry)) {
+                    throw new GradleException("Actinium contract: ${entry} missing from ${actiniumFile}")
+                }
+            }
+            // 2. Descriptor contract: execute() must reference the dhj/ types and
+            //    no longer the legacy org/embeddedt namespace.
+            def taskEntry = zip.getEntry(
+                'com/dhj/actinium/render/terrain/compile/task/ChunkBuilderMeshingTask.class')
+            def bytes = zip.getInputStream(taskEntry).bytes
+            def text = new String(bytes, 'ISO-8859-1')
+            def expected = 'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildContext'
+            if (!text.contains(expected)) {
+                throw new GradleException(
+                    "Actinium contract: ChunkBuilderMeshingTask.execute does not reference ${expected}")
+            }
+            if (text.contains('org/embeddedt/embeddium')) {
+                throw new GradleException(
+                    'Actinium contract: legacy org/embeddedt namespace still present in ChunkBuilderMeshingTask')
+            }
+        }
+
+        // 3. Compiled source contract: javac resolves these API types against the
+        //    injected artifact; inspect class constants for accidental old symbols.
+        def legacySymbols = [
+            'org/embeddedt/embeddium',
+            'net/caffeinemc/mods/sodium/api',
+            'ActiniumConfigBootstrap'
+        ]
+        sourceSets.main.output.classesDirs.files.each { File classesDir ->
+            if (!classesDir.isDirectory()) return
+            fileTree(classesDir).matching { include '**/*.class' }.each { File classFile ->
+                def pool = classPool(classFile.bytes)
+                legacySymbols.each { symbol ->
+                    if (pool.utf8.any { it != null && it.contains(symbol) }) {
+                        throw new GradleException("Compiled class ${classFile} contains removed symbol '${symbol}'")
+                    }
+                }
+            }
+        }
+
+        def configClassDir = layout.buildDirectory.file(
+            'classes/java/main/team/celeritasctm/config').get().asFile
+        def configClasses = fileTree(configClassDir).matching { include 'CeleritasConfigEntryPoint*.class' }.files
+        if (configClasses.isEmpty()) {
+            throw new GradleException("Config page contract: missing compiled classes under ${configClassDir}")
+        }
+        def configReferences = configClasses.collectMany { classFile ->
+            classPool(classFile.bytes).classes as List
+        } as Set
+        def expectedConfigClasses = [
+            'dhj/embeddedt/embeddium/api/OptionGUIConstructionEvent',
+            'dhj/embeddedt/embeddium/api/options/structure/OptionPage',
+            'dhj/embeddedt/embeddium/api/options/structure/OptionStorage',
+            'dhj/embeddedt/embeddium/api/options/control/TickBoxControl'
+        ] as Set
+        if (!configReferences.containsAll(expectedConfigClasses)) {
+            def missing = expectedConfigClasses - configReferences
+            throw new GradleException("Config page contract: compiled classes are missing API references ${missing}")
+        }
+
+        // 4. Parse mixin JSON structurally: Actinium owns the BF routing bridge.
+        def mixins = new groovy.json.JsonSlurper().parse(mixinConfig.asFile)
+        if (!(mixins.client instanceof List)
+                || mixins.client.contains('actinium.MixinChunkBuilderMeshingTask')) {
+            throw new GradleException('mixins.celeritasctm.json must not register the duplicate BF mixin')
+        }
+
+        logger.lifecycle('verifyContracts: OK (Actinium artifact, compiled API, mixin JSON)')
+    }
+}
+
+def executableTests = [
+    'testInternalFaceCulling': 'team.celeritasctm.client.model.InternalFaceCullingTest',
+    'testCtmRuleSupport': 'team.celeritasctm.client.resource.CtmRuleSupportTest',
+    'testCtmPropertiesParsing': 'team.celeritasctm.client.resource.CtmParsePropertiesTest'
+]
+
+tasks.named('compileTestJava', JavaCompile).configure {
+    def mainCompileClasspath = tasks.named('compileJava').get().classpath
+    doFirst {
+        classpath = files(mainCompileClasspath.files.findAll {
+            it.exists() && !it.name.equalsIgnoreCase('srg2mcp.jar')
+        }) + files(sourceSets.main.output)
+    }
+}
+
+executableTests.each { taskName, testClass ->
+    tasks.register(taskName, JavaExec) {
+        group = 'verification'
+        description = "Runs ${testClass} behavioral tests."
+        dependsOn tasks.named('testClasses')
+        def testClasspath = tasks.named('compileJava').get().classpath.files.findAll {
+            it.exists() && !it.name.equalsIgnoreCase('srg2mcp.jar')
+        }
+        classpath = sourceSets.test.output + sourceSets.main.output + files(testClasspath)
+        mainClass.set(testClass)
+    }
+}
+
+tasks.named('test', Test).configure {
+    enabled = false
+}
+
+tasks.named('check').configure {
+    dependsOn 'verifyContracts', executableTests.keySet()
+}
+
 
 // ========== Unimined (Minecraft/Cleanroom) ==========
 
@@ -97,7 +287,7 @@ unimined.minecraft {
 
         runs.all {
             args += ['--username', propertyString('minecraft_username')]
-            
+
             def extraPathArgument = '-Dcrl.dev.extrapath='
             def extraPaths = new LinkedHashSet<String>()
             extraPaths.addAll(project.sourceSets.main.output.files.collect { it.absolutePath })
@@ -170,15 +360,13 @@ tasks.named('remapJar').configure {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
-    // 使用 --release 8 确保字节码兼容 Java 8
+    // Java 8 bytecode is required by the 1.12.2 runtime.
     options.release = 8
 }
 
 tasks.named('compileJava', JavaCompile).configure {
-    // Fork使用 JDK 25 编译（因为 Cleanroom jar 需要 JDK 25 才能读取）
-    // Gradle 本身运行在 JDK 21 上
+    // Fork so the JDK 25 toolchain compiler reads the Java 25 Cleanroom jars.
     options.fork = true
-    options.forkOptions.javaHome = file('C:/Program Files/Zulu/zulu-25')
 }
 
 // ========== Run Configuration ==========

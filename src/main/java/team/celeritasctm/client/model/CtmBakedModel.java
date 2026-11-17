@@ -13,6 +13,7 @@ import net.minecraft.client.renderer.block.model.ItemCameraTransforms;
 import net.minecraft.client.renderer.block.model.ItemOverrideList;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.renderer.vertex.VertexFormat;
+import net.minecraft.client.renderer.vertex.VertexFormatElement;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.EnumFacing;
 import net.minecraft.util.math.AxisAlignedBB;
@@ -41,9 +42,23 @@ public class CtmBakedModel implements IBakedModel {
     public static class RenderContext {
         public IBlockAccess world;
         public BlockPos pos;
+        /**
+         * 注入时的坐标打包值（{@link BlockPos#toLong()}）。<b>不分配对象</b>，
+         * 用于发现 {@code pos} 是可变的 {@code MutableBlockPos} 且已被移动到别处：
+         * chunk 构建线程复用一个 MutableBlockPos，若它在 getExtendedState 之后又被
+         * 移动，读 {@code pos} 会得到错误方块的数据（A14/R03）。此时视为上下文失效，
+         * 直接走 vanilla fallback（宁可少做 CTM，也不按错误坐标取态）。
+         */
+        public long packedPos = Long.MIN_VALUE;
+
         public RenderContext(IBlockAccess world, BlockPos pos) {
             this.world = world;
             this.pos = pos;
+        }
+
+        /** 坐标自注入后是否未被移动。 */
+        public boolean isPosUnchanged() {
+            return pos != null && pos.toLong() == packedPos;
         }
     }
 
@@ -95,8 +110,12 @@ public class CtmBakedModel implements IBakedModel {
 
         RenderContext ctx = CURRENT_CONTEXT.get();
         // 上下文有效性校验：ThreadLocal 可能残留上一块/物品渲染的陈旧上下文，
-        // 当 pos 处的方块与当前 state 不是同一方块时视为无效（跳过处理，防止纹理错乱）
+        // 当 pos 处的方块与当前 state 不是同一方块时视为无效（跳过处理，防止纹理错乱）。
+        // 另外校验坐标自注入后未被移动（MutableBlockPos 复用，A14/R03）。
         if (ctx == null || ctx.world == null || ctx.pos == null) {
+            return parent.getQuads(state, side, rand);
+        }
+        if (ctx.packedPos != Long.MIN_VALUE && !ctx.isPosUnchanged()) {
             return parent.getQuads(state, side, rand);
         }
         if (state != null && state.getBlock() != null) {
@@ -192,17 +211,18 @@ public class CtmBakedModel implements IBakedModel {
                 return java.util.Collections.singletonList(quad);
             }
             // ===== 连接透明方块内部面剔除（还原 OptiFine 机制）=====
-            // 该方块有「连接类」CTM 规则（connect=block/tile 连接）+ 透明（非不透明立方体，
-            // 否则 vanilla 已剔除或不透明不可见）+ quad 是贴齐面 + 该面方向的邻居是同一
-            // 方块 → 剔除贴合内部面（返回空列表）。
-            // 邻居比较用 block 级（而非 state 级）：Conquest 竖半砖 CTM 规则是默认
-            // connect=block（同方块 ID 即连接，不看 facing/variant/metadata）。
-            // 贴齐判定用「quad 为全平面 + 邻居 bbox 内侧边贴合 quad 平面」而非顶点=0/1：
-            // 竖半砖随 facing 做 y 旋转后，贴合面在一侧的模型里可能是切面坐标（z=0.5），
-            // 只看 0/1 会漏剔一侧（表现为「一侧剔一侧不剔」）。bbox 比较对旋转/切面都正确。
+            // 只有同时具备三项证据才删除面（缺一不可，宁可少剔不留洞）：
+            //   1. 规则面约束：props.appliesTo(face)（findMatch 已按面过滤，此处显式复核）；
+            //   2. 连接谓词：按 props.getConnect()（block/tile/material/state）分派判定；
+            //   3. 几何证据：quad 在面法线轴上共面 + 平面贴合邻居 bbox 内侧边 +
+            //      邻居 bbox 在另两轴投影完整覆盖 quad（二维覆盖）。
+            // Conquest 竖半砖是「同 block 不同 metadata/朝向」：connect=block 允许连接，
+            // 但朝向不同的两块在切面上可能只互相覆盖一部分，二维覆盖校验会拦住这种情况，
+            // 不会把只被部分覆盖的完整面整个删掉（否则露出穿视空洞）。证据不足时保留面。
             if (isConnectingMethod(props.getMethod())
                     && quadFace != null && blockState != null && !blockState.isOpaqueCube()
-                    && isTouchingNeighborFace(quad, quadFace, blockState, ctx)) {
+                    && props.appliesTo(quadFace)
+                    && isFullyCoveredInternalFace(quad, quadFace, props, ctx)) {
                 return java.util.Collections.emptyList();
             }
             BakedQuad baseQuad = applyRule(quad, sprite, props, ctx, quadFace, blockState, 0);
@@ -236,54 +256,138 @@ public class CtmBakedModel implements IBakedModel {
     }
 
     /**
-     * quad 是否为「贴齐邻居的贴合面」（内部剔除判定）：
-     * 1. 4 个顶点在 face 轴上的坐标（模型空间，相对方块原点）全部相同（quad 是平面，
-     *    非平面 quad 如花纹/斜面不参与剔除）；
-     * 2. 邻居方块与本方块同 block（connect=block 语义）；
-     * 3. quad 平面偏移与邻居 bbox 的内侧边偏移精确贴合。
+     * 内部面剔除判定（证据驱动的薄适配层）：把 Minecraft 对象抽取成纯数据，
+     * 交给 {@link InternalFaceCulling#shouldCull} 做几何 + 连接谓词判定。
      *
-     * <p>坐标归一化：BakedQuad 顶点坐标可能是 0..1（vanilla FaceBakery 归一化）或 0..16
-     * （mod 自定义模型烘焙，如 Conquest 竖半砖），统一归一化到 0..1 再比较。
-     * bbox 用 getBoundingBox 返回的「相对方块原点 0..1 AABB」——贴合条件换算到同一
-     * 相对坐标系：A 在 face 正方向（+1 格）贴合邻居的内侧边（B.min），负方向贴合 B.max。
-     * 这样对 y 旋转过的竖半砖也正确（贴合面无论落在模型 0/1 还是 0.5，都能对上）。
+     * <p>各项证据：
+     * <ul>
+     *   <li>quad 顶点三轴范围（0..1 归一化；兼容 0..16 的自定义模型）；</li>
+     *   <li>邻居 state 与 bbox（{@code getBoundingBox}，相对方块原点 0..1）；</li>
+     *   <li>同 block / 同 actual state / 同材质；</li>
+     *   <li>connect=tile 时以「同 actual state」作为保守替代证据（见方法内注释）。</li>
+     * </ul>
      *
-     * <p>性能：平面检查（最廉价）→ 邻居取态/block 比较（一次 getBlockState）→ bbox 贴合
-     * （仅在邻居同方块时计算），快速失败顺序避免无谓开销。
+     * <p>成本顺序：最廉价的平面/范围检查在纯函数内最先执行；邻居取态只做两次。
      */
-    private static boolean isTouchingNeighborFace(BakedQuad quad, EnumFacing face, IBlockState self, RenderContext ctx) {
+    private static boolean isFullyCoveredInternalFace(BakedQuad quad, EnumFacing face,
+                                                      CtmProperties props, RenderContext ctx) {
+        if (quad == null || face == null || props == null || ctx == null) return false;
+
         int axis;
         switch (face) {
             case DOWN: case UP: axis = 1; break;
             case NORTH: case SOUTH: axis = 2; break;
             default: axis = 0; // EAST / WEST
         }
+        boolean positive = face.getAxisDirection() == EnumFacing.AxisDirection.POSITIVE;
+
+        // ---- quad 三轴范围 ----
         int[] data = quad.getVertexData();
-        int stride = quad.getFormat().getIntegerSize();
-        float first = Float.intBitsToFloat(data[axis]);
-        for (int i = 1; i < 4; i++) {
-            float v = Float.intBitsToFloat(data[i * stride + axis]);
-            if (Math.abs(v - first) > 0.001f) return false;
+        VertexFormat format = quad.getFormat();
+        if (data == null || format == null) return false;
+        int stride = format.getIntegerSize();
+        int posIdx;
+        try {
+            if (format.getElement(0).getUsage() != VertexFormatElement.EnumUsage.POSITION) return false;
+            posIdx = format.getOffset(0) / 4;
+        } catch (RuntimeException e) {
+            return false;
         }
-        // 顶点坐标 0..16（mod 自定义模型）→ 归一化到 0..1
-        float first01 = (first > 1.5f) ? first / 16.0f : first;
-        if (first01 < -0.01f || first01 > 1.01f) return false;
-        // 邻居：同方块才可能贴合（connect=block 语义，不看 facing/variant）
+        if (stride < 3 || posIdx < 0 || data.length < stride * 4) return false;
+
+        float[] min = { Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY };
+        float[] max = { Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY };
+        float maxAbs = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            int base = i * stride + posIdx;
+            if (base + 2 >= data.length) return false;
+            for (int a = 0; a < 3; a++) {
+                float v = Float.intBitsToFloat(data[base + a]);
+                if (Float.isNaN(v) || Float.isInfinite(v)) return false;
+                float av = Math.abs(v);
+                if (av > maxAbs) maxAbs = av;
+                if (v < min[a]) min[a] = v;
+                if (v > max[a]) max[a] = v;
+            }
+        }
+        float scale = InternalFaceCulling.normalizeScale(maxAbs);
+        for (int a = 0; a < 3; a++) {
+            min[a] *= scale;
+            max[a] *= scale;
+        }
+
+        // 廉价前置校验：非平面 quad（斜面/十字花纹）或平面不在方块边界附近时，
+        // 不可能构成内部面，直接返回，避免为此付出取邻居 actual state / bbox 的成本。
+        float tol = InternalFaceCulling.DEFAULT_TOLERANCE;
+        if (Math.abs(max[axis] - min[axis]) > tol) return false;
+        if (min[axis] < -tol || min[axis] > 1.0f + tol) return false;
+
+        // ---- 邻居 state / bbox ----
+        // 状态取 actual state：栅栏/玻璃板等方块的碰撞/选择箱与邻居判定依赖 actual state
+        // （连接方向放在 state 里），只有这样 bbox 与 connect=state 语义才准确。
+        // 失败（世界切片未就绪等）时退回默认 state，仍保留几何判定能力。
         BlockPos npos = ctx.pos.offset(face);
-        IBlockState neighbor = ctx.world.getBlockState(npos);
-        if (neighbor == null || neighbor.getBlock() != self.getBlock()) return false;
-        // 邻居 bbox：相对方块原点的 0..1 AABB（不是世界坐标）；贴合边取内侧边
-        AxisAlignedBB nb = neighbor.getBoundingBox(ctx.world, npos);
-        double target;
-        switch (face) {
-            case DOWN:  target = -1.0 + nb.maxY; break;
-            case UP:    target = 1.0 + nb.minY; break;
-            case NORTH: target = -1.0 + nb.maxZ; break;
-            case SOUTH: target = 1.0 + nb.minZ; break;
-            case WEST:  target = -1.0 + nb.maxX; break;
-            default:    target = 1.0 + nb.minX; break; // EAST
+        IBlockState neighborRaw;
+        try {
+            neighborRaw = ctx.world.getBlockState(npos);
+        } catch (Exception e) {
+            return false;
         }
-        return Math.abs(first01 - target) < 0.01;
+        if (neighborRaw == null || neighborRaw.getBlock() == null) return false;
+        IBlockState neighbor = safeActualState(ctx.world, npos, neighborRaw);
+
+        IBlockState selfRaw;
+        try {
+            selfRaw = ctx.world.getBlockState(ctx.pos);
+        } catch (Exception e) {
+            return false;
+        }
+        if (selfRaw == null) return false;
+        IBlockState self = safeActualState(ctx.world, ctx.pos, selfRaw);
+
+        AxisAlignedBB nb;
+        try {
+            nb = neighbor.getBoundingBox(ctx.world, npos);
+        } catch (Exception e) {
+            return false;
+        }
+        if (nb == null) return false;
+        float[] nMin = { (float) nb.minX, (float) nb.minY, (float) nb.minZ };
+        float[] nMax = { (float) nb.maxX, (float) nb.maxY, (float) nb.maxZ };
+
+        // ---- 连接谓词证据 ----
+        boolean sameBlock = neighbor.getBlock() == self.getBlock();
+        boolean sameState = sameBlock && neighbor.equals(self);
+        boolean sameMaterial;
+        try {
+            sameMaterial = neighbor.getMaterial() == self.getMaterial();
+        } catch (Exception e) {
+            sameMaterial = false;
+        }
+
+        InternalFaceCulling.ConnectKind kind =
+            InternalFaceCulling.connectKind(props.getConnect());
+
+        // connect=tile 的完整证据需要查询邻居该面的烘焙纹理（ConnectionHandler 内部私有实现）。
+        // 不在此扩展其 API，改用任务允许的保守退路：要求同 actual state。
+        // 这比「纹理相同」更严格——只会少剔，不会留洞。
+        boolean tileMatch = sameState;
+
+        return InternalFaceCulling.shouldCull(min, max, axis, positive, nMin, nMax,
+            kind, sameBlock, sameState, sameMaterial, tileMatch);
+    }
+
+    /**
+     * 取 actual state（连接方向等运行时属性在 actual state 中）。
+     * 世界切片/非常规 IBlockAccess 上可能抛异常或返回 null，此时退回原始 state。
+     */
+    private static IBlockState safeActualState(IBlockAccess world, BlockPos pos, IBlockState fallback) {
+        try {
+            IBlockState actual = fallback.getActualState(world, pos);
+            return actual != null ? actual : fallback;
+        } catch (Throwable t) {
+            return fallback;
+        }
     }
 
     /** 是否草类方块（BetterGrass 判定用） */

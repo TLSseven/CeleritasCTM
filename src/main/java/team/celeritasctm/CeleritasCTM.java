@@ -55,14 +55,12 @@ public class CeleritasCTM {
         logger.info("  config: betterGrass={} betterSnow={} connectedGlass={} betterFoliageGrass={}",
             config.betterGrass, config.betterSnow, config.connectedGlass, config.betterFoliageGrass);
 
-        // 向 Actinium 配置菜单注册本 mod 分页（冻结前调用；未装 Actinium 时跳过）
-        try {
-            com.dhj.actinium.compat.sodium.ActiniumConfigBootstrap.shared()
-                .registerConfigEntryPoint(MOD_ID, new CeleritasConfigEntryPoint());
-            logger.info("  registered config entry point in Actinium settings menu");
-        } catch (Throwable t) {
-            logger.warn("  failed to register Actinium config entry point (Actinium missing?): {}", t.toString());
-        }
+        // 向 Actinium 视频设置的选项 GUI 注册本 mod 分页。
+        //
+        // 显式能力探测（不做 catch-Throwable 兜底）：Actinium 是 required-after 依赖，
+        // 缺失时 FML 会拒载；这里唯一要诊断的是「Actinium 存在但版本不含该选项 API」。
+        // 因此先探测关键类是否可加载，再调用注册（注册阶段再抛异常即为真实不兼容）。
+        registerOptionPage();
 
         MinecraftForge.EVENT_BUS.register(this);
 
@@ -76,6 +74,26 @@ public class CeleritasCTM {
         }
 
         logger.info("  CTM properties loaded: {}", CtmPropertiesLoader.getProperties().size());
+    }
+
+    /**
+     * 探测 Actinium 的选项 GUI API 是否可用，可用时注册分页。
+     *
+     * <p>只用字符串类名探测，避免在方法体外常量化引用新 API 类型（否则类加载期
+     * 就可能 NoClassDefFoundError，探测失去意义）。探测通过后由
+     * {@link CeleritasConfigEntryPoint#register()} 建立真实链接；该阶段抛出的
+     * 异常不再被吞掉——那才是「Actinium 存在但 API 不匹配」的真实信号。
+     */
+    private void registerOptionPage() {
+        try {
+            Class.forName("dhj.embeddedt.embeddium.api.OptionGUIConstructionEvent", false,
+                CeleritasCTM.class.getClassLoader());
+        } catch (ClassNotFoundException | LinkageError t) {
+            logger.warn("  Actinium option GUI unavailable (API version mismatch, page not registered): {}",
+                t.toString());
+            return;
+        }
+        CeleritasConfigEntryPoint.register();
     }
 
     @EventHandler

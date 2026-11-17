@@ -8,15 +8,17 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import team.celeritasctm.client.model.CtmBakedModel;
+import team.celeritasctm.client.model.CtmModelCache;
 
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
+/**
+ * 为 vanilla 模型套一层 {@link team.celeritasctm.client.model.CtmBakedModel}。
+ *
+ * <p>缓存本体在 {@link CtmModelCache}（普通类）中，资源重载时由
+ * {@code CTMPackReloadListener} 调用 {@link CtmModelCache#clear()} 清理，
+ * 避免重烘焙产生的旧模型被静态 map 永久强引用（A15）。
+ */
 @Mixin(BlockModelShapes.class)
 public class MixinBlockModelShapes {
-
-    // 缓存：避免每次调用都创建新的CtmBakedModel
-    private static final Map<IBakedModel, CtmBakedModel> ctm$modelCache = new ConcurrentHashMap<>(1024);
 
     private static final String VANILLA_PREFIX = "net.minecraft";
 
@@ -32,17 +34,6 @@ public class MixinBlockModelShapes {
         // OptiFine 是逐 quad 匹配的，这里统一包装后由 CtmBakedModel 逐 quad 处理。
         if (!model.getClass().getName().startsWith(VANILLA_PREFIX)) return;
 
-        CtmBakedModel cached = ctm$modelCache.get(model);
-        if (cached != null) {
-            cir.setReturnValue(cached);
-            return;
-        }
-
-        CtmBakedModel ctmModel = new CtmBakedModel(model);
-        CtmBakedModel prev = ctm$modelCache.putIfAbsent(model, ctmModel);
-        if (prev != null) {
-            ctmModel = prev;
-        }
-        cir.setReturnValue(ctmModel);
+        cir.setReturnValue(CtmModelCache.getOrCreate(model));
     }
 }
