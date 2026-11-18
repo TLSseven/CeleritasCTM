@@ -28,10 +28,10 @@ import java.util.Set;
  * beforehand, so registering during {@code preInit} is safe.
  *
  * <p>Persistence and apply semantics: each option binds directly to the public
- * fields of {@link ModConfig}; all four options share one
+ * fields of {@link ModConfig}; all five options share one
  * {@link OptionStorage} whose {@code save} writes {@code config/celeritasctm.json}
  * and requests a chunk rebuild through {@link CeleritasCTM#requestReload()}.
- * The rebuild happens on the next client tick (no atlas re-stitch: the four
+ * The rebuild happens on the next client tick (no atlas re-stitch: the five
  * switches only affect per-quad decisions at chunk-build time). No option
  * declares {@code REQUIRES_ASSET_RELOAD} / {@code REQUIRES_RENDERER_RELOAD}, so
  * Actinium's own apply sweep will not trigger a second, slower reload.
@@ -117,6 +117,11 @@ public final class CeleritasConfigEntryPoint
                 OptionImpact.MEDIUM,
                 (config, value) -> config.connectedGlass = value,
                 config -> config.connectedGlass))
+            .add(option("internal_face_culling", "连接方块内部面剔除",
+                "仅在相邻连接方块的模型完整覆盖当前面时，删除该面。关闭后仍使用连接纹理和渲染器的常规剔面。",
+                OptionImpact.MEDIUM,
+                (config, value) -> config.internalFaceCulling = value,
+                config -> config.internalFaceCulling))
             .add(option("better_foliage_grass", "BetterFoliage 草地",
                 "允许 BetterFoliage 处理草方块（BF 的连接草地样式）。若出现紫色/白色草方块问题请关闭。",
                 OptionImpact.LOW,

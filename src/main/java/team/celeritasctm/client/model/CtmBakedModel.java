@@ -223,7 +223,7 @@ public class CtmBakedModel implements IBakedModel {
             if (props == builtinGlass && !CeleritasCTM.config().connectedGlass) {
                 return java.util.Collections.singletonList(quad);
             }
-            // ===== 连接透明方块内部面剔除（还原 OptiFine 机制）=====
+            // ===== 连接透明方块内部面剔除（可配置）=====
             // 只有同时具备三类证据才删除面（缺一不可，宁可少剔不留洞）：
             //   1. 规则面约束：props.appliesTo(face)（findMatch 已按面过滤，此处显式复核）；
             //   2. 连接谓词：与连接掩码共用 ConnectionHandler 的同一套 connect 语义
@@ -231,7 +231,8 @@ public class CtmBakedModel implements IBakedModel {
             //   3. 几何证据：邻居实际烘焙 quad（朝向面 + 同朝向 general quads）在目标平面上的
             //      轴对齐矩形并集必须完整覆盖当前 quad —— 不用 bbox / BlockFaceShape.SOLID。
             // 任何证据不足（几何非共面/非矩形/部分覆盖/异常/重入/模型偏移不一致）都保留面。
-            if (isConnectingMethod(props.getMethod())
+            if (CeleritasCTM.config().internalFaceCulling
+                    && isConnectingMethod(props.getMethod())
                     && quadFace != null && blockState != null && !blockState.isOpaqueCube()
                     && props.appliesTo(quadFace)
                     && isFullyCoveredInternalFace(quad, quadFace, props, ctx, blockState)) {

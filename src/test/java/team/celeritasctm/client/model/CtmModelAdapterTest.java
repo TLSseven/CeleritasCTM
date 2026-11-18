@@ -13,6 +13,7 @@ import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.IBlockAccess;
 import team.celeritasctm.client.model.QuadCoverage.Rect;
+import team.celeritasctm.config.ModConfig;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Proxy;
@@ -35,7 +36,8 @@ import java.util.Map;
  *   <li>查询异常 / 取态失败 → 无证据（保留面）；</li>
  *   <li>嵌套查询后 {@link CtmBakedModel#CURRENT_CONTEXT} 与抑制标志恢复；</li>
  *   <li>{@link CtmBakedModel#sameFiniteOffset} 的偏移一致性要求；</li>
- *   <li>小于几何 eps 的真实细缝（1e-5）在 U/V 两方向都不被合并。</li>
+ *   <li>小于几何 eps 的真实细缝（1e-5）在 U/V 两方向都不被合并；</li>
+ *   <li>配置字段 {@code internalFaceCulling}：旧 JSON 缺键默认 true、false 可持久化往返。</li>
  * </ul>
  *
  * <p>运行：{@code ./gradlew testCtmModelAdapter}（或直接 java 运行本类）。
@@ -61,6 +63,7 @@ public final class CtmModelAdapterTest {
         offsetConsistencyGuard();
         subEpsilonSlitsKept();
         productionFrameConfig();
+        internalFaceCullingConfigDefaults();
 
         System.out.println();
         System.out.println("passed=" + passed + " failed=" + failed);
@@ -306,6 +309,36 @@ public final class CtmModelAdapterTest {
             !InternalFaceCulling.shouldCull(target, new ArrayList<Rect>(), true, EPS));
         check("degenerate target keeps",
             !InternalFaceCulling.shouldCull(new Rect(0.5f, 0.5f, 0f, 1f), cover, true, EPS));
+    }
+
+    /**
+     * 内部面剔除开关的配置语义（直接对 {@link ModConfig} 做 Gson 反序列化，与
+     * {@code ModConfig#load()} 同一机制，不触碰文件/游戏目录）：
+     * 旧 JSON 缺键沿用字段初值 true；显式 false 可往返持久化；其它键不受影响。
+     */
+    private static void internalFaceCullingConfigDefaults() {
+        com.google.gson.Gson gson = new com.google.gson.Gson();
+
+        check("new ModConfig defaults internalFaceCulling=true",
+            new ModConfig().internalFaceCulling);
+
+        // 升级前写出的 JSON（完全没有该键）→ 默认 true
+        ModConfig legacy = gson.fromJson(
+            "{\"betterGrass\":false,\"betterSnow\":true,\"connectedGlass\":true,"
+                + "\"betterFoliageGrass\":false}", ModConfig.class);
+        check("legacy JSON without key defaults true", legacy != null && legacy.internalFaceCulling);
+        check("legacy JSON other keys still parsed",
+            legacy != null && !legacy.betterGrass && !legacy.betterFoliageGrass);
+
+        // 显式 false → false，并可从序列化结果再读回
+        ModConfig off = gson.fromJson("{\"internalFaceCulling\":false}", ModConfig.class);
+        check("explicit false parsed", off != null && !off.internalFaceCulling);
+        ModConfig roundTrip = gson.fromJson(gson.toJson(off), ModConfig.class);
+        check("false survives persistence round trip",
+            roundTrip != null && !roundTrip.internalFaceCulling);
+
+        ModConfig on = gson.fromJson("{\"internalFaceCulling\":true}", ModConfig.class);
+        check("explicit true parsed", on != null && on.internalFaceCulling);
     }
 
     // ------------------------------------------------------------------ fixtures

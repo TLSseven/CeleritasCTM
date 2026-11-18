@@ -33,7 +33,7 @@ public class CeleritasCTM {
     @Mod.Instance(MOD_ID)
     public static CeleritasCTM instance;
 
-    /** 用户配置（四个开关；热路径直接读 public 字段） */
+    /** 用户配置（五个开关；热路径直接读 public 字段） */
     private static ModConfig config = new ModConfig();
 
     public static ModConfig config() { return config; }
@@ -52,8 +52,9 @@ public class CeleritasCTM {
 
         // 加载用户配置（必须在 CTM 属性加载之前，玻璃补丁注入依赖 connectedGlass 开关）
         config = ModConfig.load();
-        logger.info("  config: betterGrass={} betterSnow={} connectedGlass={} betterFoliageGrass={}",
-            config.betterGrass, config.betterSnow, config.connectedGlass, config.betterFoliageGrass);
+        logger.info("  config: betterGrass={} betterSnow={} connectedGlass={} internalFaceCulling={} betterFoliageGrass={}",
+            config.betterGrass, config.betterSnow, config.connectedGlass,
+            config.internalFaceCulling, config.betterFoliageGrass);
 
         // 向 Actinium 视频设置的选项 GUI 注册本 mod 分页。
         //
@@ -118,7 +119,7 @@ public class CeleritasCTM {
     /**
      * 配置 Apply 后延迟到客户端 tick 执行重载。
      *
-     * <p>四个开关都只是 chunk 构建时的运行时判断（CtmBakedModel/BF 桥读取 ModConfig
+     * <p>五个开关都只是 chunk 构建时的运行时判断（CtmBakedModel/BF 桥读取 ModConfig
      * 字段），图集没有任何变化：草地/雪地用的 grass_top/mycelium_top/snow 本就已缝合，
      * 玻璃 tile 在启动时已无条件注入缝合（injectVanillaGlassPatch 不依赖开关）。
      * 因此只调用 renderGlobal.loadRenderers()（经 Celeritas MixinRenderGlobalProxy 级联
