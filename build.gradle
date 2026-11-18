@@ -49,6 +49,10 @@ java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(25)
     }
+    // Dependencies here are published for Java 8/17/21/25 variants; auto-targeting
+    // would resolve a second, lower-target variant set for the Java 25 toolchain.
+    // The produced bytecode is already pinned by `options.release = 8`.
+    disableAutoTargetJvm()
 }
 
 // ========== Repositories ==========
@@ -112,7 +116,7 @@ dependencies {
 
 def classPool = { byte[] bytes ->
     def input = new DataInputStream(new ByteArrayInputStream(bytes))
-    if (input.readInt() != -889275714) {
+    if (input.readInt() != (int) 0xCAFEBABE) {
         throw new GradleException('Invalid Java class file')
     }
     input.skipBytes(4)
@@ -139,23 +143,36 @@ tasks.register('verifyContracts') {
     group = 'verification'
     description = 'Verifies the compile-time contracts against the injected Actinium jar.'
 
-    def mixinConfig = layout.projectDirectory.file('src/main/resources/mixins.celeritasctm.json')
-    def actiniumFile = targetActiniumJar.singleFile
+    // Everything the check needs is captured here as lazy objects, so the task
+    // action never touches `project` / `sourceSets` (configuration-cache safe)
+    // and the Actinium jar path is only resolved when the task actually runs.
+    def mixinConfigFile = layout.projectDirectory.file('src/main/resources/mixins.celeritasctm.json')
+    def actiniumJar = targetActiniumJar
+    // FileCollections (not pre-built FileTrees) are captured so the task inputs
+    // stay serializable for the configuration cache; trees are materialized in
+    // the action instead.
+    def compiledMainClasses = sourceSets.main.output.classesDirs
 
     dependsOn tasks.named('compileJava')
-    inputs.files(sourceSets.main.output.classesDirs)
-    inputs.files(targetActiniumJar)
-    inputs.file(mixinConfig)
+    inputs.files(compiledMainClasses)
+    inputs.files(actiniumJar)
+    inputs.file(mixinConfigFile)
     outputs.upToDateWhen { false }
 
     doLast {
-        // 1. Namespace contract: the target Actinium artifact must expose the
-        //    embeddium types we compile against, under the `dhj/` namespace.
+        def actiniumFile = actiniumJar.singleFile
+        if (!actiniumFile.isFile()) {
+            throw new GradleException("Actinium contract: jar not found at ${actiniumFile}")
+        }
+        def mainClassFiles = compiledMainClasses.asFileTree.matching {
+            include '**/*.class'
+        }.files
+
+        // 1. Artifact contract: the target Actinium artifact must expose the
+        //    option-GUI API we compile against, under the `dhj/` namespace.
+        //    The old chunk-mesher API is intentionally NOT required: no source
+        //    references it any more, so its removal must not fail this build.
         def requiredEntries = [
-            'com/dhj/actinium/render/terrain/compile/task/ChunkBuilderMeshingTask.class',
-            'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildContext.class',
-            'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildOutput.class',
-            'dhj/embeddedt/embeddium/impl/util/task/CancellationToken.class',
             'dhj/embeddedt/embeddium/api/OptionGUIConstructionEvent.class',
             'dhj/embeddedt/embeddium/api/options/structure/OptionPage.class',
             'dhj/embeddedt/embeddium/api/options/structure/OptionStorage.class',
@@ -169,47 +186,30 @@ tasks.register('verifyContracts') {
                     throw new GradleException("Actinium contract: ${entry} missing from ${actiniumFile}")
                 }
             }
-            // 2. Descriptor contract: execute() must reference the dhj/ types and
-            //    no longer the legacy org/embeddedt namespace.
-            def taskEntry = zip.getEntry(
-                'com/dhj/actinium/render/terrain/compile/task/ChunkBuilderMeshingTask.class')
-            def bytes = zip.getInputStream(taskEntry).bytes
-            def text = new String(bytes, 'ISO-8859-1')
-            def expected = 'dhj/embeddedt/embeddium/impl/render/chunk/compile/ChunkBuildContext'
-            if (!text.contains(expected)) {
-                throw new GradleException(
-                    "Actinium contract: ChunkBuilderMeshingTask.execute does not reference ${expected}")
-            }
-            if (text.contains('org/embeddedt/embeddium')) {
-                throw new GradleException(
-                    'Actinium contract: legacy org/embeddedt namespace still present in ChunkBuilderMeshingTask')
-            }
         }
 
-        // 3. Compiled source contract: javac resolves these API types against the
+        // 2. Compiled source contract: javac resolves these API types against the
         //    injected artifact; inspect class constants for accidental old symbols.
         def legacySymbols = [
             'org/embeddedt/embeddium',
             'net/caffeinemc/mods/sodium/api',
             'ActiniumConfigBootstrap'
         ]
-        sourceSets.main.output.classesDirs.files.each { File classesDir ->
-            if (!classesDir.isDirectory()) return
-            fileTree(classesDir).matching { include '**/*.class' }.each { File classFile ->
-                def pool = classPool(classFile.bytes)
-                legacySymbols.each { symbol ->
-                    if (pool.utf8.any { it != null && it.contains(symbol) }) {
-                        throw new GradleException("Compiled class ${classFile} contains removed symbol '${symbol}'")
-                    }
+        mainClassFiles.each { classFile ->
+            def pool = classPool(classFile.bytes)
+            legacySymbols.each { symbol ->
+                if (pool.utf8.any { it != null && it.contains(symbol) }) {
+                    throw new GradleException("Compiled class ${classFile} contains removed symbol '${symbol}'")
                 }
             }
         }
 
-        def configClassDir = layout.buildDirectory.file(
-            'classes/java/main/team/celeritasctm/config').get().asFile
-        def configClasses = fileTree(configClassDir).matching { include 'CeleritasConfigEntryPoint*.class' }.files
+        // 3. Config page contract: the entry point must reference the option API.
+        def configClasses = mainClassFiles.findAll {
+            it.name.startsWith('CeleritasConfigEntryPoint') && it.name.endsWith('.class')
+        }
         if (configClasses.isEmpty()) {
-            throw new GradleException("Config page contract: missing compiled classes under ${configClassDir}")
+            throw new GradleException('Config page contract: no compiled CeleritasConfigEntryPoint* classes')
         }
         def configReferences = configClasses.collectMany { classFile ->
             classPool(classFile.bytes).classes as List
@@ -225,30 +225,72 @@ tasks.register('verifyContracts') {
             throw new GradleException("Config page contract: compiled classes are missing API references ${missing}")
         }
 
-        // 4. Parse mixin JSON structurally: Actinium owns the BF routing bridge.
-        def mixins = new groovy.json.JsonSlurper().parse(mixinConfig.asFile)
-        if (!(mixins.client instanceof List)
-                || mixins.client.contains('actinium.MixinChunkBuilderMeshingTask')) {
+        // 4. Mixin JSON contract: every declared mixin must have been compiled, and
+        //    the duplicate Actinium BF mesher mixin must not be re-registered.
+        def mixins = new groovy.json.JsonSlurper().parse(mixinConfigFile.asFile)
+        if (mixins.client != null && !(mixins.client instanceof List)) {
+            throw new GradleException('mixins.celeritasctm.json: "client" must be a JSON array')
+        }
+        def declared = []
+        if (mixins.mixins instanceof List) declared.addAll(mixins.mixins)
+        if (mixins.client instanceof List) declared.addAll(mixins.client)
+        if (declared.contains('actinium.MixinChunkBuilderMeshingTask')) {
             throw new GradleException('mixins.celeritasctm.json must not register the duplicate BF mixin')
         }
+        def mixinPackage = mixins.package?.toString() ?: ''
+        def relativeClassPaths = mainClassFiles.collect { File classFile ->
+            classFile.absolutePath.replace('\\', '/')
+        } as Set
+        declared.each { mixinName ->
+            def relative = (mixinPackage ? mixinPackage.replace('.', '/') + '/' : '') +
+                mixinName.toString().replace('.', '/') + '.class'
+            if (!relativeClassPaths.any { it.endsWith('/' + relative) }) {
+                throw new GradleException("Mixin contract: declared mixin ${mixinName} has no compiled class ${relative}")
+            }
+        }
 
-        logger.lifecycle('verifyContracts: OK (Actinium artifact, compiled API, mixin JSON)')
+        logger.lifecycle('verifyContracts: OK (Actinium options API, compiled classes, mixin JSON)')
     }
 }
 
 def executableTests = [
     'testInternalFaceCulling': 'team.celeritasctm.client.model.InternalFaceCullingTest',
     'testCtmRuleSupport': 'team.celeritasctm.client.resource.CtmRuleSupportTest',
-    'testCtmPropertiesParsing': 'team.celeritasctm.client.resource.CtmParsePropertiesTest'
+    'testCtmPropertiesParsing': 'team.celeritasctm.client.resource.CtmParsePropertiesTest',
+    'testCtmGenericRules': 'team.celeritasctm.client.resource.CtmGenericRuleTest',
+    'testBetterFoliageCompat': 'team.celeritasctm.client.foliage.BetterFoliageCompatTest',
+    'testCtmModelAdapter': 'team.celeritasctm.client.model.CtmModelAdapterTest',
+    'testConnectionHandlerTileLookup': 'team.celeritasctm.client.util.ConnectionHandlerTileLookupTest'
 ]
 
+// Unimined generates `.gradle/unimined/local/mappings/srg2mcp.jar`: a zip of
+// methods/fields/params CSV mapping data, not a class archive. On the compiler
+// classpath javac reports it as an invalid/bad class jar, so this one known
+// mapping artifact is filtered out. Nothing in main/test source can resolve
+// classes from it.
+def mappingArtifactName = 'srg2mcp.jar'
+
+// The main compile classpath is declared once, lazily, so both compileTestJava and
+// the JavaExec test tasks share exactly the classpath main was compiled against.
+// `tasks.named(...).map { it.classpath }` is a Provider: it is only evaluated when
+// a consuming task resolves its classpath, not while configuring the build.
+def mainCompileClasspath = files(
+    tasks.named('compileJava', JavaCompile).map { it.classpath }
+)
+
+def usableCompileClasspath = mainCompileClasspath.filter { File entry ->
+    // Drop only the known mapping artifact; keep everything else (including
+    // entries that do not exist yet, e.g. outputs produced by dependency tasks).
+    !entry.name.equalsIgnoreCase(mappingArtifactName)
+}
+
 tasks.named('compileTestJava', JavaCompile).configure {
-    def mainCompileClasspath = tasks.named('compileJava').get().classpath
-    doFirst {
-        classpath = files(mainCompileClasspath.files.findAll {
-            it.exists() && !it.name.equalsIgnoreCase('srg2mcp.jar')
-        }) + files(sourceSets.main.output)
-    }
+    // test.compileClasspath already extends main's, but it can also carry the
+    // mapping artifact; filter it too. Then union with the main compile cp so the
+    // tests see exactly the jars main was compiled against.
+    classpath = files(sourceSets.test.compileClasspath).filter { File entry ->
+        !entry.name.equalsIgnoreCase(mappingArtifactName)
+    } + usableCompileClasspath
 }
 
 executableTests.each { taskName, testClass ->
@@ -256,11 +298,21 @@ executableTests.each { taskName, testClass ->
         group = 'verification'
         description = "Runs ${testClass} behavioral tests."
         dependsOn tasks.named('testClasses')
-        def testClasspath = tasks.named('compileJava').get().classpath.files.findAll {
-            it.exists() && !it.name.equalsIgnoreCase('srg2mcp.jar')
-        }
-        classpath = sourceSets.test.output + sourceSets.main.output + files(testClasspath)
+        classpath = files(
+            sourceSets.test.output,
+            sourceSets.main.output,
+            files(sourceSets.test.runtimeClasspath).filter { File entry ->
+                !entry.name.equalsIgnoreCase(mappingArtifactName)
+            },
+            usableCompileClasspath
+        )
         mainClass.set(testClass)
+        // Tests build/run against the Java 25 toolchain artifacts; report in UTF-8.
+        // `javaLauncher` stays a Provider so nothing is resolved at configuration time.
+        javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(25)
+        }
+        jvmArgs = ['-Dfile.encoding=UTF-8', '-Dsun.stdout.encoding=UTF-8', '-Dsun.stderr.encoding=UTF-8']
     }
 }
 

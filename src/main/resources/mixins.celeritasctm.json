@@ -8,6 +8,7 @@
     "MixinBlock",
     "MixinBlockModelShapes",
     "MixinTextureMapExtended",
+    "actinium.MixinBetterFoliageCompatImpl",
     "actinium.MixinWorldProviderSkyColor",
     "actinium.MixinEntityRendererWorldGuard",
     "actinium.MixinGuiIngameGuard"

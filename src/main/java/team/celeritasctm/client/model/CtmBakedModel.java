@@ -7,6 +7,7 @@ import net.minecraft.block.BlockMycelium;
 import net.minecraft.block.BlockSnow;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.BlockModelShapes;
 import net.minecraft.client.renderer.block.model.BakedQuad;
 import net.minecraft.client.renderer.block.model.IBakedModel;
 import net.minecraft.client.renderer.block.model.ItemCameraTransforms;
@@ -16,7 +17,6 @@ import net.minecraft.client.renderer.vertex.VertexFormat;
 import net.minecraft.client.renderer.vertex.VertexFormatElement;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.EnumFacing;
-import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.IBlockAccess;
@@ -38,6 +38,13 @@ public class CtmBakedModel implements IBakedModel {
     private final IBakedModel parent;
 
     public static final ThreadLocal<RenderContext> CURRENT_CONTEXT = new ThreadLocal<>();
+
+    /**
+     * 抑制 MixinBlock 写入复用上下文：查询邻居 extended state 时会再次进入
+     * {@code Block.getExtendedState}，若不抑制会把当前渲染上下文改成邻居坐标。
+     * 查询结束后由调用方按保存值恢复。
+     */
+    public static final ThreadLocal<Boolean> EXTENDED_STATE_SUPPRESS = ThreadLocal.withInitial(() -> false);
 
     public static class RenderContext {
         public IBlockAccess world;
@@ -105,6 +112,11 @@ public class CtmBakedModel implements IBakedModel {
         // 连接检测（connect=tile）查询邻居纹理时，必须返回原始 quads，
         // 否则拿到的会是替换后的精灵，导致纹理比较永远失败
         if (ConnectionHandler.isTileLookupActive()) {
+            return parent.getQuads(state, side, rand);
+        }
+
+        // 无状态（物品/无上下文渲染）一律交还 parent：CTM 需要世界坐标才能取连接信息
+        if (state == null) {
             return parent.getQuads(state, side, rand);
         }
 
@@ -186,39 +198,42 @@ public class CtmBakedModel implements IBakedModel {
             }
         }
 
-        // ===== 连接玻璃（可配置）=====
-        // 染色玻璃：内置玻璃规则只匹配 blocks/glass（无色），染色玻璃（blocks/glass_<color>）
-        // 在这里手动走同一套连接掩码 + tile 选择。
-        if (CeleritasCTM.config().connectedGlass && isStainedGlass(blockState) && quadFace != null) {
-            CtmProperties glassRule = CtmPropertiesLoader.GLASS_RULE;
-            if (glassRule != null) {
-                int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, quadFace, glassRule, sprite);
-                String tile = glassRule.tileAt(CTM_INDEX_MAP[mask & 255]);
-                if (tile != null) {
-                    TextureAtlasSprite ts = CTMSpriteRegistry.getTileSprite(glassRule, tile);
-                    if (ts != null && ts.getIconWidth() > 1) {
-                        return java.util.Collections.singletonList(remapUV(quad, sprite, ts));
-                    }
+        // 普通规则（替换本体）先匹配：资源包规则（含资源包提供的 glass 规则）永远优先，
+        // 不受 connectedGlass 开关影响。
+        CtmProperties builtinGlass = CtmPropertiesLoader.getGlassRule();
+        CtmProperties props = CtmPropertiesLoader.findMatch(
+            sprite.getIconName(), blockState, quadFace, ctx.world, ctx.pos);
+
+        // 没有任何普通规则命中时的内置染色玻璃回退：内置规则只声明 matchTiles=blocks/glass
+        // （无色玻璃），染色玻璃（blocks/glass_<color>）走同一套连接掩码 + tile 选择。
+        // 仅当内置规则存在、开关开启、且当前方块确实是原版染色玻璃时启用；
+        // 资源包自带 glass 规则会先在 findMatch 命中，因此不会被此回退覆盖。
+        if (props == null && CeleritasCTM.config().connectedGlass
+                && builtinGlass != null && isStainedGlass(blockState) && quadFace != null) {
+            int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, quadFace, builtinGlass, sprite);
+            String tile = builtinGlass.tileAt(CTM_INDEX_MAP[mask & 255]);
+            if (tile != null) {
+                TextureAtlasSprite ts = CTMSpriteRegistry.getTileSprite(builtinGlass, tile);
+                if (ts != null && ts.getIconWidth() > 1) {
+                    return java.util.Collections.singletonList(remapUV(quad, sprite, ts));
                 }
             }
         }
 
-        // 普通规则（替换本体）
-        CtmProperties props = CtmPropertiesLoader.findMatch(sprite.getIconName(), blockState, quadFace);
         if (props != null) {
-            // 玻璃规则在配置关闭时不应用（无色玻璃走 findMatch 命中）
-            if (props == CtmPropertiesLoader.GLASS_RULE && !CeleritasCTM.config().connectedGlass) {
+            // 只有「内置玻璃回退规则」受 connectedGlass 开关约束；
+            // 资源包提供的 glass 规则是普通 CTM 规则，开关关闭时也必须生效。
+            if (props == builtinGlass && !CeleritasCTM.config().connectedGlass) {
                 return java.util.Collections.singletonList(quad);
             }
             // ===== 连接透明方块内部面剔除（还原 OptiFine 机制）=====
-            // 只有同时具备三项证据才删除面（缺一不可，宁可少剔不留洞）：
+            // 只有同时具备三类证据才删除面（缺一不可，宁可少剔不留洞）：
             //   1. 规则面约束：props.appliesTo(face)（findMatch 已按面过滤，此处显式复核）；
-            //   2. 连接谓词：按 props.getConnect()（block/tile/material/state）分派判定；
-            //   3. 几何证据：quad 在面法线轴上共面 + 平面贴合邻居 bbox 内侧边 +
-            //      邻居 bbox 在另两轴投影完整覆盖 quad（二维覆盖）。
-            // Conquest 竖半砖是「同 block 不同 metadata/朝向」：connect=block 允许连接，
-            // 但朝向不同的两块在切面上可能只互相覆盖一部分，二维覆盖校验会拦住这种情况，
-            // 不会把只被部分覆盖的完整面整个删掉（否则露出穿视空洞）。证据不足时保留面。
+            //   2. 连接谓词：与连接掩码共用 ConnectionHandler 的同一套 connect 语义
+            //      （block/tile/material/state/connectTiles；tile 用邻居该面原始烘焙纹理作证）；
+            //   3. 几何证据：邻居实际烘焙 quad（朝向面 + 同朝向 general quads）在目标平面上的
+            //      轴对齐矩形并集必须完整覆盖当前 quad —— 不用 bbox / BlockFaceShape.SOLID。
+            // 任何证据不足（几何非共面/非矩形/部分覆盖/异常/重入/模型偏移不一致）都保留面。
             if (isConnectingMethod(props.getMethod())
                     && quadFace != null && blockState != null && !blockState.isOpaqueCube()
                     && props.appliesTo(quadFace)
@@ -259,19 +274,21 @@ public class CtmBakedModel implements IBakedModel {
      * 内部面剔除判定（证据驱动的薄适配层）：把 Minecraft 对象抽取成纯数据，
      * 交给 {@link InternalFaceCulling#shouldCull} 做几何 + 连接谓词判定。
      *
-     * <p>各项证据：
-     * <ul>
-     *   <li>quad 顶点三轴范围（0..1 归一化；兼容 0..16 的自定义模型）；</li>
-     *   <li>邻居 state 与 bbox（{@code getBoundingBox}，相对方块原点 0..1）；</li>
-     *   <li>同 block / 同 actual state / 同材质；</li>
-     *   <li>connect=tile 时以「同 actual state」作为保守替代证据（见方法内注释）。</li>
-     * </ul>
+     * <p>几何证据来自邻居<b>实际烘焙 quad</b>（对侧面 + 朝向一致的 general quads），
+     * 而不是 bbox 或 {@code BlockFaceShape.SOLID}——楼梯、竖半砖的 bbox/面形状可能与
+     * 实际渲染几何不同。任何一步不确定（取态/取模型/取 quad 异常、CTM 重入、几何不合格、
+     * 模型偏移不一致）都保留面。
      *
-     * <p>成本顺序：最廉价的平面/范围检查在纯函数内最先执行；邻居取态只做两次。
+     * <p>状态与模型顺序与渲染器一致：先 {@code getActualState}，用 actual 查
+     * {@code getModelForState}，再 {@code getExtendedState(actual,...)} 传给
+     * {@code model.getQuads}（extended 通常不是模型注册键）。
+     *
+     * <p>成本顺序：最廉价的共面/矩形校验最先执行；偏移/连接谓词其次；最后才查询邻居模型。
      */
     private static boolean isFullyCoveredInternalFace(BakedQuad quad, EnumFacing face,
                                                       CtmProperties props, RenderContext ctx) {
         if (quad == null || face == null || props == null || ctx == null) return false;
+        if (ctx.pos == null || ctx.world == null) return false;
 
         int axis;
         switch (face) {
@@ -280,124 +297,314 @@ public class CtmBakedModel implements IBakedModel {
             default: axis = 0; // EAST / WEST
         }
         boolean positive = face.getAxisDirection() == EnumFacing.AxisDirection.POSITIVE;
+        float eps = QuadCoverage.GEOMETRY_EPSILON;
 
-        // ---- quad 三轴范围 ----
-        int[] data = quad.getVertexData();
-        VertexFormat format = quad.getFormat();
-        if (data == null || format == null) return false;
-        int stride = format.getIntegerSize();
-        int posIdx;
-        try {
-            if (format.getElement(0).getUsage() != VertexFormatElement.EnumUsage.POSITION) return false;
-            posIdx = format.getOffset(0) / 4;
-        } catch (RuntimeException e) {
-            return false;
-        }
-        if (stride < 3 || posIdx < 0 || data.length < stride * 4) return false;
+        // ---- 目标 quad：必须是共面的轴对齐矩形 ----
+        float[] min = new float[3];
+        float[] max = new float[3];
+        if (!quadBounds(quad, min, max)) return false;
+        if (Math.abs(max[axis] - min[axis]) > eps) return false;
+        float plane = min[axis];
+        if (plane < -eps || plane > 1.0f + eps) return false;
 
-        float[] min = { Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY, Float.POSITIVE_INFINITY };
-        float[] max = { Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY, Float.NEGATIVE_INFINITY };
-        float maxAbs = 0.0f;
-        for (int i = 0; i < 4; i++) {
-            int base = i * stride + posIdx;
-            if (base + 2 >= data.length) return false;
-            for (int a = 0; a < 3; a++) {
-                float v = Float.intBitsToFloat(data[base + a]);
-                if (Float.isNaN(v) || Float.isInfinite(v)) return false;
-                float av = Math.abs(v);
-                if (av > maxAbs) maxAbs = av;
-                if (v < min[a]) min[a] = v;
-                if (v > max[a]) max[a] = v;
-            }
-        }
-        float scale = InternalFaceCulling.normalizeScale(maxAbs);
-        for (int a = 0; a < 3; a++) {
-            min[a] *= scale;
-            max[a] *= scale;
-        }
+        QuadCoverage.Rect target = quadRect(quad, axis, plane, eps);
+        if (target == null) return false;
 
-        // 廉价前置校验：非平面 quad（斜面/十字花纹）或平面不在方块边界附近时，
-        // 不可能构成内部面，直接返回，避免为此付出取邻居 actual state / bbox 的成本。
-        float tol = InternalFaceCulling.DEFAULT_TOLERANCE;
-        if (Math.abs(max[axis] - min[axis]) > tol) return false;
-        if (min[axis] < -tol || min[axis] > 1.0f + tol) return false;
-
-        // ---- 邻居 state / bbox ----
-        // 状态取 actual state：栅栏/玻璃板等方块的碰撞/选择箱与邻居判定依赖 actual state
-        // （连接方向放在 state 里），只有这样 bbox 与 connect=state 语义才准确。
-        // 失败（世界切片未就绪等）时退回默认 state，仍保留几何判定能力。
+        // ---- 邻居 / 自身状态 ----
         BlockPos npos = ctx.pos.offset(face);
         IBlockState neighborRaw;
-        try {
-            neighborRaw = ctx.world.getBlockState(npos);
-        } catch (Exception e) {
-            return false;
-        }
-        if (neighborRaw == null || neighborRaw.getBlock() == null) return false;
-        IBlockState neighbor = safeActualState(ctx.world, npos, neighborRaw);
-
         IBlockState selfRaw;
         try {
+            neighborRaw = ctx.world.getBlockState(npos);
             selfRaw = ctx.world.getBlockState(ctx.pos);
         } catch (Exception e) {
             return false;
         }
-        if (selfRaw == null) return false;
-        IBlockState self = safeActualState(ctx.world, ctx.pos, selfRaw);
-
-        AxisAlignedBB nb;
+        if (neighborRaw == null || neighborRaw.getBlock() == null) return false;
+        if (selfRaw == null || selfRaw.getBlock() == null) return false;
+        // 取态会再次进入 MixinBlock#getExtendedState：查询期间抑制其对复用上下文的写入，
+        // 并保存/恢复 CURRENT_CONTEXT 引用（支持嵌套）。
+        IBlockState neighborActual;
+        IBlockState selfActual;
+        IBlockState neighborExtended;
+        boolean previousSuppress = EXTENDED_STATE_SUPPRESS.get();
+        RenderContext savedCtx = CURRENT_CONTEXT.get();
+        EXTENDED_STATE_SUPPRESS.set(true);
         try {
-            nb = neighbor.getBoundingBox(ctx.world, npos);
-        } catch (Exception e) {
-            return false;
+            neighborActual = safeActualState(ctx.world, npos, neighborRaw);
+            selfActual = safeActualState(ctx.world, ctx.pos, selfRaw);
+            // model registry 键：必须用 actual state；extended 只用于 getQuads。
+            neighborExtended = safeExtendedState(neighborActual, ctx.world, npos);
+        } finally {
+            EXTENDED_STATE_SUPPRESS.set(previousSuppress);
+            if (savedCtx != null) {
+                CURRENT_CONTEXT.set(savedCtx);
+            } else {
+                CURRENT_CONTEXT.remove();
+            }
         }
-        if (nb == null) return false;
-        float[] nMin = { (float) nb.minX, (float) nb.minY, (float) nb.minZ };
-        float[] nMax = { (float) nb.maxX, (float) nb.maxY, (float) nb.maxZ };
 
-        // AABB may be the default full cube even when the rendered shape is partial (e.g. stairs).
-        // BlockFaceShape still allows full faces on transparent blocks such as glass.
-        boolean neighborFaceSolid;
+        // 取态失败 = 无证据：保留面（不得用 raw fallback 冒充 actual/extended）。
+        if (neighborActual == null || selfActual == null || neighborExtended == null) return false;
+        if (neighborActual.getBlock() == null || selfActual.getBlock() == null) return false;
+
+        // ---- 模型偏移：渲染器会把 state.getOffset 加到顶点上 ----
+        // 本地坐标比较只在两边偏移一致时成立；偏移非零且不相等、或无法读取 → 保留面。
+        if (!sameFiniteOffset(selfActual, ctx.pos, neighborActual, npos, ctx.world)) return false;
+
+        // ---- 连接谓词证据（与连接掩码同一实现）----
+        // 注意 self 语义：连接掩码内部用 world.getBlockState(pos)（raw state），
+        // 这里同样传 selfRaw，保证掩码与剔除对 state 的比较基准一致（actual/extended
+        // 只用于模型选择与几何证据）。connect=tile 的几何覆盖必须与「主语义」同源：
+        // connectTiles 只是额外放行，若连接仅由 connectTiles 成立，邻居该面纹理与
+        // 本 quad 未必相同，不能作为几何遮盖证据（同一面混纹理时不得互相作证）。
+        InternalFaceCulling.ConnectKind kind =
+            InternalFaceCulling.connectKind(props.getConnect());
+        boolean connects;
         try {
-            neighborFaceSolid = neighbor.getBlockFaceShape(ctx.world, npos, face.getOpposite())
-                == net.minecraft.block.state.BlockFaceShape.SOLID;
+            connects = kind == InternalFaceCulling.ConnectKind.TILE
+                ? ConnectionHandler.connectsToPrimary(ctx.world, ctx.pos, selfRaw, props,
+                    quad.getSprite(), face, npos)
+                : ConnectionHandler.connectsTo(ctx.world, ctx.pos, selfRaw, props,
+                    quad.getSprite(), face, npos);
         } catch (Throwable t) {
             return false;
         }
-        if (!neighborFaceSolid) return false;
+        if (!connects) return false;
 
-        // ---- 连接谓词证据 ----
-        boolean sameBlock = neighbor.getBlock() == self.getBlock();
-        boolean sameState = sameBlock && neighbor.equals(self);
-        boolean sameMaterial;
-        try {
-            sameMaterial = neighbor.getMaterial() == self.getMaterial();
-        } catch (Exception e) {
-            sameMaterial = false;
-        }
+        // ---- 邻居实际 quad 在目标平面上的矩形并集 ----
+        // connect=tile 时覆盖证据必须与连接证据同源：只接受原始纹理与当前 quad 相同的面。
+        String tileFilter = kind == InternalFaceCulling.ConnectKind.TILE && quad.getSprite() != null
+            ? quad.getSprite().getIconName() : null;
+        // 邻居朝向本方块的方向在法线轴上的符号：EAST 面的邻居面朝西（-1）
+        int requiredNormalSign = positive ? -1 : 1;
+        List<QuadCoverage.Rect> neighborRects = neighborFaceRects(
+            neighborActual, neighborExtended, npos, face.getOpposite(),
+            plane - InternalFaceCulling.planeShift(positive),
+            axis, requiredNormalSign, tileFilter, eps);
+        if (neighborRects == null || neighborRects.isEmpty()) return false;
 
-        InternalFaceCulling.ConnectKind kind =
-            InternalFaceCulling.connectKind(props.getConnect());
-
-        // connect=tile 的完整证据需要查询邻居该面的烘焙纹理（ConnectionHandler 内部私有实现）。
-        // 不在此扩展其 API，改用任务允许的保守退路：要求同 actual state。
-        // 这比「纹理相同」更严格——只会少剔，不会留洞。
-        boolean tileMatch = sameState;
-
-        return InternalFaceCulling.shouldCull(min, max, axis, positive, nMin, nMax,
-            kind, sameBlock, sameState, sameMaterial, tileMatch);
+        // 连接谓词已由上面的统一入口证明；不要再用 connectAllows 二次分派，
+        // 否则 connectTiles-only 连接会被否决。
+        return InternalFaceCulling.shouldCull(target, neighborRects, true, eps);
     }
 
     /**
-     * 取 actual state（连接方向等运行时属性在 actual state 中）。
-     * 世界切片/非常规 IBlockAccess 上可能抛异常或返回 null，此时退回原始 state。
+     * 两方块的模型偏移是否可安全比较：都必须有限且逐分量相等（容差仅抵消浮点误差）。
+     * 读取异常视为不可比较（保留面）。
      */
-    private static IBlockState safeActualState(IBlockAccess world, BlockPos pos, IBlockState fallback) {
+    static boolean sameFiniteOffset(IBlockState self, BlockPos selfPos,
+                                    IBlockState neighbor, BlockPos neighborPos,
+                                    IBlockAccess world) {
+        if (self == null || neighbor == null || world == null
+                || selfPos == null || neighborPos == null) {
+            return false;
+        }
         try {
-            IBlockState actual = fallback.getActualState(world, pos);
-            return actual != null ? actual : fallback;
+            net.minecraft.util.math.Vec3d a = self.getBlock().getOffset(self, world, selfPos);
+            net.minecraft.util.math.Vec3d b = neighbor.getBlock().getOffset(neighbor, world, neighborPos);
+            if (a == null || b == null) return false;
+            if (!finite(a.x) || !finite(a.y) || !finite(a.z)
+                    || !finite(b.x) || !finite(b.y) || !finite(b.z)) {
+                return false;
+            }
+            float eps = QuadCoverage.GEOMETRY_EPSILON;
+            return Math.abs(a.x - b.x) <= eps
+                && Math.abs(a.y - b.y) <= eps
+                && Math.abs(a.z - b.z) <= eps;
         } catch (Throwable t) {
-            return fallback;
+            return false;
+        }
+    }
+
+    private static boolean finite(double v) {
+        return !Double.isNaN(v) && !Double.isInfinite(v);
+    }
+
+    /** 读取 quad 三轴范围（方块单位，不做单位推断）；数据不合法返回 false。 */
+    private static boolean quadBounds(BakedQuad quad, float[] min, float[] max) {
+        VertexLayout layout = VertexLayout.of(quad);
+        return layout != null && QuadCoverage.bounds(
+            quad.getVertexData(), layout.stride, layout.positionOffset, min, max);
+    }
+
+    /** 提取 quad 在给定平面上的轴对齐矩形；不是合格矩形返回 null。 */
+    private static QuadCoverage.Rect quadRect(BakedQuad quad, int axis, float plane, float eps) {
+        VertexLayout layout = VertexLayout.of(quad);
+        if (layout == null) return null;
+        return QuadCoverage.rect(quad.getVertexData(), layout.stride, layout.positionOffset,
+            axis, plane, eps);
+    }
+
+    /**
+     * 查询邻居模型在指定面上的实际 quad，提取与给定平面共面的轴对齐矩形。
+     *
+     * <p>模型按 <b>actual</b> state 解析（extended state 通常不是模型注册键），
+     * quads 用 <b>extended</b> state 查询（连接方向等运行时属性在其中），
+     * 种子用 {@code MathHelper.getPositionRandom(npos)}——与渲染器一致。
+     *
+     * <p>同时查询指定面与 general quads（side=null）：竖半砖等无 cullface 模型
+     * 的面全部进入 general quads。查询期间：
+     * <ul>
+     *   <li>设置 CTM 原始 quad 查询标志，阻止 CtmBakedModel 递归替换（再次进入时返回
+     *       parent 原始 quads）；</li>
+     *   <li>抑制 MixinBlock 对复用 RenderContext 的写入，避免邻居 getExtendedState
+     *       篡改当前渲染上下文；</li>
+     *   <li>保存并恢复 {@link #CURRENT_CONTEXT} 引用与抑制标志（支持嵌套）。</li>
+     * </ul>
+     * 任何异常返回 null（调用方保留面）。
+     */
+    private static List<QuadCoverage.Rect> neighborFaceRects(IBlockState neighborActual,
+                                                             IBlockState neighborExtended,
+                                                             BlockPos npos,
+                                                             EnumFacing neighborFace, float localPlane,
+                                                             int axis, int requiredNormalSign,
+                                                             String tileFilter, float eps) {
+        RenderContext savedCtx = CURRENT_CONTEXT.get();
+        boolean previousGuard = ConnectionHandler.beginRawQuadLookup();
+        boolean previousSuppress = EXTENDED_STATE_SUPPRESS.get();
+        EXTENDED_STATE_SUPPRESS.set(true);
+        try {
+            BlockModelShapes shapes = Minecraft.getMinecraft()
+                .getBlockRendererDispatcher().getBlockModelShapes();
+            if (shapes == null) return null;
+            IBakedModel model = shapes.getModelForState(neighborActual);
+            if (model == null) return null;
+            if (model.isBuiltInRenderer()) return null;
+            return collectNeighborRects(model, neighborExtended, npos, neighborFace,
+                localPlane, axis, requiredNormalSign, tileFilter, eps);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            EXTENDED_STATE_SUPPRESS.set(previousSuppress);
+            ConnectionHandler.endRawQuadLookup(previousGuard);
+            if (savedCtx != null) {
+                CURRENT_CONTEXT.set(savedCtx);
+            } else {
+                CURRENT_CONTEXT.remove();
+            }
+        }
+    }
+
+    /**
+     * 从已解析的邻居模型收集覆盖矩形（包内可见的测试注入点）：
+     * 同时查询指定面与 general quads，种子用 {@code MathHelper.getPositionRandom(npos)}。
+     * 查询期间的原始 quad 守卫由调用方持有。
+     */
+    static List<QuadCoverage.Rect> collectNeighborRects(IBakedModel model, IBlockState extended,
+                                                        BlockPos npos, EnumFacing neighborFace,
+                                                        float localPlane, int axis,
+                                                        int requiredNormalSign,
+                                                        String tileFilter, float eps) {
+        long rand = MathHelper.getPositionRandom(npos);
+        List<QuadCoverage.Rect> rects = new ArrayList<>(4);
+        collectRects(model, extended, neighborFace, rand, axis, localPlane,
+            requiredNormalSign, tileFilter, eps, rects);
+        collectRects(model, extended, null, rand, axis, localPlane,
+            requiredNormalSign, tileFilter, eps, rects);
+        return rects;
+    }
+
+    /**
+     * 收集指定面上的合格覆盖矩形。筛选条件：
+     * <ul>
+     *   <li>共面（在 {@code localPlane ± eps}）；</li>
+     *   <li>轴对齐矩形（{@link QuadCoverage#rect} 会拒绝对角/蝶形/退化 quad）；</li>
+     *   <li>朝向与目标面相反（邻居面朝本方块），避免把背面/侧向 quad 当作遮盖证据；
+     *       side != null 时还要求 quad 的 face 精确等于 side，无朝向 quad 不作证；</li>
+     *   <li>connect=tile 时原始纹理名与当前 quad 相同（同一面混纹理时不得互相作证）。</li>
+     * </ul>
+     */
+    static void collectRects(IBakedModel model, IBlockState state, EnumFacing side, long rand,
+                             int axis, float localPlane, int requiredNormalSign,
+                             String tileFilter, float eps,
+                             List<QuadCoverage.Rect> out) {
+        List<BakedQuad> quads = model.getQuads(state, side, rand);
+        if (quads == null || quads.isEmpty()) return;
+        for (BakedQuad q : quads) {
+            if (q == null) continue;
+            // 由 side 查询到的 quad 必须是该朝向；general 查询则靠下方法线符号校验。
+            if (side != null && q.getFace() != side) continue;
+            if (tileFilter != null) {
+                TextureAtlasSprite s = q.getSprite();
+                if (s == null || !tileFilter.equals(s.getIconName())) continue;
+            }
+            VertexLayout layout = VertexLayout.of(q);
+            if (layout == null) continue;
+            if (QuadCoverage.axisNormalSign(q.getVertexData(), layout.stride,
+                layout.positionOffset, axis) != requiredNormalSign) {
+                continue;
+            }
+            QuadCoverage.Rect r = QuadCoverage.rect(q.getVertexData(), layout.stride,
+                layout.positionOffset, axis, localPlane, eps);
+            if (r != null) out.add(r);
+        }
+    }
+
+    /** 顶点格式布局（stride 与位置偏移，单位 int）。 */
+    private static final class VertexLayout {
+        final int stride;
+        final int positionOffset;
+
+        private VertexLayout(int stride, int positionOffset) {
+            this.stride = stride;
+            this.positionOffset = positionOffset;
+        }
+
+        static VertexLayout of(BakedQuad quad) {
+            if (quad == null) return null;
+            int[] data = quad.getVertexData();
+            VertexFormat format = quad.getFormat();
+            if (data == null || format == null) return null;
+            try {
+                if (format.getElementCount() == 0) return null;
+                VertexFormatElement pos = format.getElement(0);
+                if (pos.getUsage() != VertexFormatElement.EnumUsage.POSITION) return null;
+                // 位置必须是 3 个 float（不能用 short/其他类型，否则 intBitsToFloat 会读错）
+                if (pos.getType() != VertexFormatElement.EnumType.FLOAT) return null;
+                if (pos.getElementCount() != 3) return null;
+                if (pos.getIndex() != 0) return null;
+                int stride = format.getIntegerSize();
+                int offset = format.getOffset(0) / 4;
+                if (stride < 3 || offset < 0 || offset + 2 >= stride) return null;
+                if ((long) stride * 4 > data.length) return null;
+                return new VertexLayout(stride, offset);
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * 取 extended state（连接方向等运行时属性在其中；扩展状态可能依赖世界）。
+     *
+     * <p>顺序固定为：<b>先 actual，再 extended(actual)</b>，与渲染器一致
+     * （{@code VintageBlockRenderer}：actual → shapes.getModelForState(actual) →
+     * extended(actual) → model.getQuads(extended,...)）。extended state 通常不是
+     * 模型注册键，因此绝不能用 extended 去查模型。
+     *
+     * <p>查询失败返回 {@code null}（调用方必须视为「无证据」并保留面）：
+     * 不能用 fallback state 冒充 extended state 作为几何证据。
+     */
+    static IBlockState safeExtendedState(IBlockState actual, IBlockAccess world, BlockPos pos) {
+        if (actual == null || world == null || pos == null) return null;
+        try {
+            return actual.getBlock().getExtendedState(actual, world, pos);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 取 actual state。查询失败/无世界坐标/返回 null 时返回 {@code null}
+     * （调用方必须视为「无证据」并保留面，绝不把异常当空气或沿用 raw state）。
+     */
+    static IBlockState safeActualState(IBlockAccess world, BlockPos pos, IBlockState fallback) {
+        if (fallback == null || world == null || pos == null) return null;
+        try {
+            return fallback.getActualState(world, pos);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -628,7 +835,8 @@ public class CtmBakedModel implements IBakedModel {
         // 纯 matchBlocks 规则（如 Conquest block208 匹配 minecraft:grass_path 方块）
         // 不应劫持瓦片名——否则 Patrix 等 matchTiles 规则输出的瓦片会被 block-based
         // 规则覆盖（土径显示 Conquest 纹理的根因）。
-        CtmProperties next = CtmPropertiesLoader.findMatch(tileSprite.getIconName(), blockState, quadFace);
+        CtmProperties next = CtmPropertiesLoader.findMatch(tileSprite.getIconName(), blockState, quadFace,
+            ctx.world, ctx.pos);
         if (next != null && next != props && !next.getMatchTilesClean().isEmpty()) {
             BakedQuad chained = applyRule(quad, sprite, next, ctx, quadFace, blockState, depth + 1);
             if (chained != quad) return chained;
@@ -693,10 +901,15 @@ public class CtmBakedModel implements IBakedModel {
      */
     private BakedQuad remapUV(BakedQuad quad, TextureAtlasSprite original, TextureAtlasSprite replacement) {
         VertexFormat format = quad.getFormat();
+        if (format == null) return quad;
         int uvOffset = format.getUvOffsetById(0);
         if (uvOffset < 0) return quad;
         int stride = format.getIntegerSize();
         int uvIdx = uvOffset / 4;
+        int[] data = quad.getVertexData();
+        // 格式/数据长度防护：UV 必须是 2 个 float 且 4 个顶点都在数据范围内
+        if (stride < 1 || uvIdx < 0 || uvIdx + 1 >= stride || data == null) return quad;
+        if ((long) stride * 4 > data.length) return quad;
 
         float oMinU = original.getMinU(), oMaxU = original.getMaxU();
         float oMinV = original.getMinV(), oMaxV = original.getMaxV();
@@ -704,7 +917,6 @@ public class CtmBakedModel implements IBakedModel {
         float dv = oMaxV - oMinV;
         if (du <= 0.0f || dv <= 0.0f) return quad;
 
-        int[] data = quad.getVertexData();
         int[] copy = Arrays.copyOf(data, data.length);
         for (int i = 0; i < 4; i++) {
             int idx = i * stride + uvIdx;

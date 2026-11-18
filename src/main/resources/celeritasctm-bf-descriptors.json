@@ -1,0 +1,21 @@
+{
+  "_comment": "Expected descriptors of the Actinium alpha-0.0.13 BetterFoliageCompatImpl entry points that MixinBetterFoliageCompatImpl injects into. Consumed by an external verifier; not read by the mod at runtime.",
+  "ownerClass": "com/dhj/actinium/compat/betterfoliage/BetterFoliageCompatImpl",
+  "methods": [
+    {
+      "name": "canRenderBlockInLayer",
+      "descriptor": "(Lnet/minecraft/block/Block;Lnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/BlockRenderLayer;)Z",
+      "injection": "@Inject HEAD, cancellable"
+    },
+    {
+      "name": "renderVanillaBlock",
+      "descriptor": "(Lnet/minecraft/client/renderer/BlockRendererDispatcher;Lnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/math/BlockPos;Lnet/minecraft/world/IBlockAccess;Lnet/minecraft/client/renderer/BufferBuilder;Lnet/minecraft/util/BlockRenderLayer;)Z",
+      "injection": "@Inject HEAD, cancellable"
+    },
+    {
+      "name": "tryRenderFastBlock",
+      "descriptor": "(Lnet/minecraft/block/state/IBlockState;Lnet/minecraft/util/math/BlockPos;Lcom/dhj/actinium/world/cloned/ActiniumBlockAccess;Lcom/dhj/actinium/render/terrain/compile/VintageChunkBuildContext;Lnet/minecraft/util/BlockRenderLayer;)Z",
+      "injection": "@Inject HEAD, cancellable"
+    }
+  ]
+}

@@ -53,6 +53,9 @@ public abstract class MixinTextureMapExtended {
     @Inject(method = "finishLoading", at = @At("HEAD"), remap = true)
     private void ctm$beforeFinishLoading(Stitcher stitcher, ProgressManager.ProgressBar bar,
                                          int minSpriteSize, int maxSpriteSize, CallbackInfo ci) {
+        // 只处理 Block 图集；自定义图集（GUI/粒子等）不承载 CTM 瓦片，必须整体跳过。
+        // 规则由 TextureStitchEvent.Pre 在本方法之前重建（CeleritasCTM#onTextureStitchPre）。
+        if (((TextureMap) (Object) this) != Minecraft.getMinecraft().getTextureMapBlocks()) return;
         int added = addCTMTiles(stitcher);
         CeleritasCTM.logger.info("CTM: added {} tile sprites to stitcher", added);
     }
@@ -104,17 +107,23 @@ public abstract class MixinTextureMapExtended {
         int mipmapLevels = ((TextureMap) (Object) this).getMipmapLevels();
 
         // 完全复刻 vanilla TextureMap.loadTexture 的精灵加载序列，
-        // 一次性处理：iconWidth/Height、动画帧（.mcmeta）、mipmap 链
+        // 一次性处理：iconWidth/Height、动画帧（.mcmeta）、mipmap 链。
+        // makeFromResource 内部会关闭传入的 IResource；这里不再持有该句柄。
         PngSizeInfo sizeInfo = PngSizeInfo.makeFromResource(resourceManager.getResource(pngLoc));
         if (sizeInfo.pngWidth < 1 || sizeInfo.pngHeight < 1) return null;
 
         TextureAtlasSprite sprite = spriteConstructor.newInstance(tileLoc.toString());
 
+        // 第二个资源句柄必须无条件关闭：loadSprite / loadSpriteFrames 抛出时
+        // 若不关闭会随每次 F3+T 泄漏 zip 句柄（资源包是 zip 时尤为明显）。
         IResource resource = resourceManager.getResource(pngLoc);
-        boolean hasAnim = resource.getMetadata("animation") != null;
-        sprite.loadSprite(sizeInfo, hasAnim);               // 设置 iconWidth/Height + UV 比例
-        sprite.loadSpriteFrames(resource, mipmapLevels + 1); // 填充帧 + 切分动画帧
-        resource.close();
+        try {
+            boolean hasAnim = resource.getMetadata("animation") != null;
+            sprite.loadSprite(sizeInfo, hasAnim);                // 设置 iconWidth/Height + UV 比例
+            sprite.loadSpriteFrames(resource, mipmapLevels + 1); // 填充帧 + 切分动画帧
+        } finally {
+            resource.close();
+        }
 
         if (mipmapLevels > 0) {
             sprite.generateMipmaps(mipmapLevels);           // 生成 mip 链（vanilla loadTexture 同样如此）

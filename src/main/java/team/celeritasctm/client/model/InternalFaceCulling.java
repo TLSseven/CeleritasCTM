@@ -1,29 +1,31 @@
 package team.celeritasctm.client.model;
 
+import team.celeritasctm.client.model.QuadCoverage.Rect;
+
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * 内部面剔除的纯几何/连接谓词（不依赖 Minecraft 类型，可直接单测）。
  *
- * <p>剔除一个面必须同时具备四项证据（缺一不可）：
+ * <p>剔除一个面必须同时具备三类证据（缺一不可，证据不足即保留面）：
  * <ol>
- *   <li><b>邻居面完整</b>：朝向当前方块的邻居面必须是完整实面；</li>
- *   <li><b>同轴共面贴合</b>：quad 在面法线轴上是一个平面，且该平面与邻居 bbox 的
- *       内侧边精确贴合（相差不超过容差）；</li>
- *   <li><b>二维完整覆盖</b>：邻居 bbox 在 quad 平面内的另两轴投影必须完整覆盖 quad
- *       的另两轴范围 —— 只贴合一条边、只覆盖一部分时不得剔除，否则会露出空洞；</li>
  *   <li><b>连接谓词</b>：按 {@code connect=block|tile|material|state} 判定邻居确实
  *       应该与本方块连接；未知取值退化为「同 state + 同 block」的保守判定。</li>
+ *   <li><b>目标面可度量</b>：当前 quad 在面法线轴上共面，且在另两轴上构成轴对齐矩形
+ *       （对角/梯形/退化 quad 无法度量，直接保留）。</li>
+ *   <li><b>邻居真实几何覆盖</b>：邻居<b>实际烘焙 quad</b> 在该平面上的矩形并集必须完整
+ *       覆盖目标矩形（支持一个面拆成多个 quad）。只用 bbox 或
+ *       {@code BlockFaceShape.SOLID} 不足以为证：楼梯、竖半砖的 bbox/面形状都可能
+ *       与渲染出的面不同，会误剔出空洞。</li>
  * </ol>
  *
- * <p>坐标约定：所有 quad/bbox 坐标均已归一化到 0..1 的方块模型空间。邻居 bbox 的
- * 「内侧边」是相对邻居自身原点的偏移，换算到本方块模型空间时：正方向邻居
- * （EAST/SOUTH/UP）的内侧边 = {@code 1 + neighborMin[axis]}，负方向邻居
- * （WEST/NORTH/DOWN）的内侧边 = {@code -1 + neighborMax[axis]}。这样对旋转/切面
- * 模型（竖半砖等）都成立。
+ * <p>坐标约定：所有坐标都是烘焙后的方块单位（0..1 = 一格，MC/Forge 的 baked 位置
+ * 即为方块单位，不做基于数值大小的单位推断）。邻居 quad 的坐标相对邻居自身原点，
+ * 换算到本方块空间时只需平移法线轴：正方向邻居（EAST/SOUTH/UP）+1，负方向 -1；
+ * 平面内另两轴不做变换。
  */
 public final class InternalFaceCulling {
-
-    /** 默认容差（方块模型空间，1.0 = 一格） */
-    public static final float DEFAULT_TOLERANCE = 0.01f;
 
     /** connect 属性语义 */
     public enum ConnectKind {
@@ -55,52 +57,6 @@ public final class InternalFaceCulling {
         }
     }
 
-    /**
-     * 顶点坐标归一化：部分 mod 模型（如 Conquest 竖半砖）烘焙时使用 0..16 单位，
-     * vanilla FaceBakery 使用 0..1。以整体最大绝对值为判据统一缩放。
-     */
-    public static float normalizeScale(float maxAbsCoordinate) {
-        return maxAbsCoordinate > 1.5f ? 1.0f / 16.0f : 1.0f;
-    }
-
-    /** 单轴坐标归一化（供调用方逐个换算时使用）。 */
-    public static float normalizeCoordinate(float value) {
-        return Math.abs(value) > 1.5f ? value / 16.0f : value;
-    }
-
-    /** 同一组数值在容差内是否相等（用于共面判定）。 */
-    public static boolean isPlanar(float[] values, float tolerance) {
-        if (values == null || values.length == 0) return false;
-        float first = values[0];
-        for (int i = 1; i < values.length; i++) {
-            if (Math.abs(values[i] - first) > tolerance) return false;
-        }
-        return true;
-    }
-
-    /** 邻居在一轴上的投影是否完整覆盖 quad 的该轴范围。 */
-    public static boolean covers(float quadMin, float quadMax,
-                                 float neighborMin, float neighborMax,
-                                 float tolerance) {
-        return neighborMin <= quadMin + tolerance && neighborMax >= quadMax - tolerance;
-    }
-
-    /**
-     * quad 平面是否与邻居内侧边贴合。
-     *
-     * @param axis     面法线轴（0=X, 1=Y, 2=Z）
-     * @param positive 邻居位于正方向（EAST/SOUTH/UP）时为 true
-     * @param plane    quad 在 axis 上的坐标（已归一化）
-     */
-    public static boolean planeTouchesNeighbor(int axis, boolean positive, float plane,
-                                               float[] neighborMin, float[] neighborMax,
-                                               float tolerance) {
-        if (axis < 0 || axis > 2) return false;
-        if (plane < -tolerance || plane > 1.0f + tolerance) return false;
-        float inner = positive ? 1.0f + neighborMin[axis] : -1.0f + neighborMax[axis];
-        return Math.abs(plane - inner) <= tolerance;
-    }
-
     /** 连接谓词是否满足（证据由调用方收集，本方法只做语义分派）。 */
     public static boolean connectAllows(ConnectKind kind, boolean sameBlock, boolean sameState,
                                         boolean sameMaterial, boolean tileMatch) {
@@ -120,77 +76,89 @@ public final class InternalFaceCulling {
         }
     }
 
+    /** 法线轴方向：正方向邻居（EAST/SOUTH/UP）平移 +1，负方向 -1。 */
+    public static float planeShift(boolean positive) {
+        return positive ? 1.0f : -1.0f;
+    }
+
+    /**
+     * 完整剔除判定（默认几何容差）。
+     *
+     * @param target        当前 quad 在其平面内的轴对齐矩形（方块单位）
+     * @param neighborRects 邻居实际烘焙 quad 的矩形（已由调用方筛选为与目标平面共面，
+     *                      平面内两轴与目标同坐标系）
+     */
+    public static boolean shouldCull(Rect target, List<Rect> neighborRects,
+                                     ConnectKind kind, boolean sameBlock, boolean sameState,
+                                     boolean sameMaterial, boolean tileMatch) {
+        return shouldCull(target, neighborRects, kind, sameBlock, sameState,
+                sameMaterial, tileMatch, QuadCoverage.GEOMETRY_EPSILON);
+    }
+
     /**
      * 完整剔除判定。
      *
-     * @param quadMin      quad 三轴最小坐标（0..1 模型空间）
-     * @param quadMax      quad 三轴最大坐标（0..1 模型空间）
-     * @param axis         面法线轴
-     * @param positive     邻居是否在位正方向
-     * @param neighborMin  邻居 bbox 最小角（相对邻居原点）
-     * @param neighborMax  邻居 bbox 最大角（相对邻居原点）
-     * @param kind         connect 语义
-     * @param sameBlock    邻居与本方块是否同一 Block
-     * @param sameState    邻居与本方块（actual state）是否完全相等
-     * @param sameMaterial 邻居与本方块材质是否相同
-     * @param tileMatch    connect=tile 时邻居该面纹理是否与当前 quad 纹理一致
+     * @param target        当前 quad 在面法线轴上共面后的轴对齐矩形；{@code null} 保留
+     * @param neighborRects 邻居实际 quad 的轴对齐矩形（已共面筛选；可含退化项，会被忽略）
+     * @param eps           几何容差（只抵消浮点误差，不可用于缝补真实间隙）
      */
-    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
-                                     float[] neighborMin, float[] neighborMax,
+    public static boolean shouldCull(Rect target, List<Rect> neighborRects,
                                      ConnectKind kind, boolean sameBlock, boolean sameState,
-                                     boolean sameMaterial, boolean tileMatch) {
-        return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
-                kind, sameBlock, sameState, sameMaterial, tileMatch, true, DEFAULT_TOLERANCE);
-    }
+                                     boolean sameMaterial, boolean tileMatch, float eps) {
+        if (target == null || neighborRects == null) return false;
+        if (eps < 0.0f) eps = QuadCoverage.GEOMETRY_EPSILON;
+        if (!target.isNonDegenerate(eps)) return false;
 
-    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
-                                     float[] neighborMin, float[] neighborMax,
-                                     ConnectKind kind, boolean sameBlock, boolean sameState,
-                                     boolean sameMaterial, boolean tileMatch, float tolerance) {
-        return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
-                kind, sameBlock, sameState, sameMaterial, tileMatch, true, tolerance);
-    }
-
-    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
-                                     float[] neighborMin, float[] neighborMax,
-                                     ConnectKind kind, boolean sameBlock, boolean sameState,
-                                     boolean sameMaterial, boolean tileMatch,
-                                     boolean neighborFaceSolid) {
-        return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
-                kind, sameBlock, sameState, sameMaterial, tileMatch,
-                neighborFaceSolid, DEFAULT_TOLERANCE);
-    }
-
-    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
-                                     float[] neighborMin, float[] neighborMax,
-                                     ConnectKind kind, boolean sameBlock, boolean sameState,
-                                     boolean sameMaterial, boolean tileMatch,
-                                     boolean neighborFaceSolid, float tolerance) {
-        if (quadMin == null || quadMax == null || neighborMin == null || neighborMax == null) return false;
-        if (quadMin.length < 3 || quadMax.length < 3 || neighborMin.length < 3 || neighborMax.length < 3) {
-            return false;
-        }
-        if (axis < 0 || axis > 2) return false;
-        if (tolerance < 0.0f) tolerance = DEFAULT_TOLERANCE;
-
-        // 1) 邻居朝向当前方块的面必须完整；默认 AABB 不能证明楼梯等模型的实际遮挡形状
-        if (!neighborFaceSolid) return false;
-
-        // 2) 连接谓词：不连接就不可能形成内部面
+        // 1) 连接谓词不连接就不可能形成内部面
         if (!connectAllows(kind, sameBlock, sameState, sameMaterial, tileMatch)) return false;
 
-        // 3) quad 在该轴上必须是平面
-        float plane = quadMin[axis];
-        if (Math.abs(quadMax[axis] - plane) > tolerance) return false;
+        return covered(target, neighborRects, eps);
+    }
 
-        // 3) 平面与邻居内侧边贴合
-        if (!planeTouchesNeighbor(axis, positive, plane, neighborMin, neighborMax, tolerance)) return false;
+    /**
+     * 生产路径使用的重载：连接证据由调用方以<b>统一谓词</b>
+     * {@code ConnectionHandler.connectsTo} 计算后直接传入。
+     *
+     * <p>为什么不在这里再按 {@link ConnectKind} 分派一次：{@code connectTiles}
+     * 是连接谓词里的额外放行条件（例如 plank ↔ slab），而 {@link #connectAllows}
+     * 只认识 connect 主语义，会在 {@code connectsTo=true} 时再次否决，导致规则
+     * 明明连接却不剔面。生产路径因此只保留一次判定（与掩码同源），避免两套语义漂移。
+     *
+     * @param connected 已由统一连接谓词证明的连接结果
+     */
+    public static boolean shouldCull(Rect target, List<Rect> neighborRects,
+                                     boolean connected, float eps) {
+        if (!connected) return false;
+        if (target == null || neighborRects == null) return false;
+        if (eps < 0.0f) eps = QuadCoverage.GEOMETRY_EPSILON;
+        if (!target.isNonDegenerate(eps)) return false;
+        return covered(target, neighborRects, eps);
+    }
 
-        // 4) 另两轴二维完整覆盖
-        for (int a = 0; a < 3; a++) {
-            if (a == axis) continue;
-            if (!covers(quadMin[a], quadMax[a], neighborMin[a], neighborMax[a], tolerance)) return false;
+    /** 邻居实际 quad 的平面内并集是否完整覆盖目标（已通过连接谓词后调用）。 */
+    private static boolean covered(Rect target, List<Rect> neighborRects, float eps) {
+        List<Rect> usable = new ArrayList<>(neighborRects.size());
+        for (Rect r : neighborRects) {
+            if (r == null) continue;
+            if (!r.isNonDegenerate(eps)) continue;
+            usable.add(r);
         }
-        return true;
+        return QuadCoverage.unionCovers(usable, target, eps);
+    }
+
+    /**
+     * 邻居矩形平移到本方块空间后是否与给定平面共面。
+     *
+     * <p>平面不在 {@link Rect} 中存储，因此由调用方在提取邻居矩形时按
+     * {@code localPlane = targetPlane - planeShift} 过滤；本方法保留给需要显式
+     * 复核共面性的调用方。
+     */
+    public static boolean coplanar(float targetPlane, float neighborLocalPlane,
+                                   float planeShift, float eps) {
+        if (Float.isNaN(targetPlane) || Float.isNaN(neighborLocalPlane)
+                || Float.isInfinite(targetPlane) || Float.isInfinite(neighborLocalPlane)) {
+            return false;
+        }
+        return Math.abs((neighborLocalPlane + planeShift) - targetPlane) <= eps;
     }
 }

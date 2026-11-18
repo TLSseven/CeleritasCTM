@@ -20,6 +20,11 @@ public class MixinBlock {
     @Inject(method = "getExtendedState", at = @At("HEAD"))
     private void ctm$beforeGetExtendedState(IBlockState state, IBlockAccess world, BlockPos pos,
                                              CallbackInfoReturnable<IBlockState> cir) {
+        // 内部面剔除查询邻居几何时会再次进入 getExtendedState；此时不得改写
+        // 当前渲染上下文（复用对象 + 复用 MutableBlockPos），否则会污染正在渲染的方块。
+        if (Boolean.TRUE.equals(CtmBakedModel.EXTENDED_STATE_SUPPRESS.get())) {
+            return;
+        }
         CtmBakedModel.RenderContext ctx = ctm$ctx.get();
         ctx.world = world;
         ctx.pos = pos;

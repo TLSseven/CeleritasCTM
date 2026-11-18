@@ -77,12 +77,19 @@ public final class CtmRuleSupport {
     public static final class BlockMatch {
         private final String key;                    // 规范化键：数字 ID 为 "#<id>"，否则 "namespace:path"
         private final Integer numericId;             // 纯数字 ID 时非 null
-        private final Map<String, String> properties;
+        // 属性名 → 允许值列表。单个值与多值（prop=a,b）统一为列表，匹配时任一相等即可。
+        private final Map<String, List<String>> properties;
 
-        BlockMatch(String key, Integer numericId, Map<String, String> properties) {
+        BlockMatch(String key, Integer numericId, Map<String, List<String>> properties) {
             this.key = key;
             this.numericId = numericId;
-            this.properties = Collections.unmodifiableMap(new LinkedHashMap<>(properties));
+            Map<String, List<String>> copy = new LinkedHashMap<>();
+            if (properties != null) {
+                for (Map.Entry<String, List<String>> e : properties.entrySet()) {
+                    copy.put(e.getKey(), Collections.unmodifiableList(new ArrayList<>(e.getValue())));
+                }
+            }
+            this.properties = Collections.unmodifiableMap(copy);
         }
 
         /** 规范化键（数字 ID 条目为 {@code #<id>}） */
@@ -93,21 +100,39 @@ public final class CtmRuleSupport {
 
         public boolean isNumeric() { return numericId != null; }
 
-        /** 状态谓词（可能为空） */
-        public Map<String, String> getProperties() { return properties; }
+        /**
+         * 状态谓词（可能为空）。多值谓词以逗号连接后返回（例如 {@code age=7,8}），
+         * 仅用于展示/兼容；判定请使用 {@link #matchesProperties}。
+         */
+        public Map<String, String> getProperties() {
+            Map<String, String> out = new LinkedHashMap<>();
+            for (Map.Entry<String, List<String>> e : properties.entrySet()) {
+                out.put(e.getKey(), String.join(",", e.getValue()));
+            }
+            return out;
+        }
+
+        /** 每个属性允许的取值列表（多值谓词；空谓词时为空 Map） */
+        public Map<String, List<String>> getPropertyValues() { return properties; }
 
         /**
          * 谓词是否被给定状态属性满足。空谓词恒真。
+         *
+         * <p>多值谓词（{@code prop=a,b}）语义为 OR：实际值匹配任一允许值即可。
          *
          * @param stateProperties 方块状态属性（键=属性名，值=属性值字符串）
          */
         public boolean matchesProperties(Map<String, String> stateProperties) {
             if (properties.isEmpty()) return true;
             if (stateProperties == null) return false;
-            for (Map.Entry<String, String> e : properties.entrySet()) {
+            for (Map.Entry<String, List<String>> e : properties.entrySet()) {
                 String actual = stateProperties.get(e.getKey());
                 if (actual == null) return false;
-                if (!actual.equalsIgnoreCase(e.getValue())) return false;
+                boolean any = false;
+                for (String allowed : e.getValue()) {
+                    if (actual.equalsIgnoreCase(allowed)) { any = true; break; }
+                }
+                if (!any) return false;
             }
             return true;
         }
@@ -126,8 +151,8 @@ public final class CtmRuleSupport {
         public String toString() {
             if (isNumeric()) return "#" + numericId;
             StringBuilder sb = new StringBuilder(key);
-            for (Map.Entry<String, String> e : properties.entrySet()) {
-                sb.append(':').append(e.getKey()).append('=').append(e.getValue());
+            for (Map.Entry<String, List<String>> e : properties.entrySet()) {
+                sb.append(':').append(e.getKey()).append('=').append(String.join(",", e.getValue()));
             }
             return sb.toString();
         }
@@ -149,13 +174,15 @@ public final class CtmRuleSupport {
         if (token == null) return null;
         String t = token.trim();
         if (t.isEmpty()) return null;
+        // 尾部/连续冒号、尾部/连续逗号一定是写坏了；不能靠 split 丢弃空段后当作合法
+        if (t.endsWith(":") || t.contains("::") || t.endsWith(",") || t.contains(",,")) return null;
 
         // 纯数字 = OptiFine block ID 写法
         if (isAllDigits(t)) {
             try {
                 int id = Integer.parseInt(t);
                 if (id < 0 || id > 4095) return null; // 文档范围 0-4095
-                return new BlockMatch("#" + id, id, Collections.<String, String>emptyMap());
+                return new BlockMatch("#" + id, id, Collections.<String, List<String>>emptyMap());
             } catch (NumberFormatException e) {
                 return null;
             }
@@ -179,25 +206,58 @@ public final class CtmRuleSupport {
             path = parts[0];
             predStart = 1;
         }
+        if (!isValidIdentifier(namespace) || !isValidIdentifier(path)) return null;
 
-        Map<String, String> predicates = new LinkedHashMap<>();
+        Map<String, List<String>> predicates = new LinkedHashMap<>();
         for (int i = predStart; i < parts.length; i++) {
             String seg = parts[i].trim();
-            if (seg.isEmpty()) continue;
+            if (seg.isEmpty()) return null;
             for (String piece : seg.split(",")) {
                 String p = piece.trim();
-                if (p.isEmpty()) continue;
+                if (p.isEmpty()) return null; // "age=7," / "age=,7" 是写坏了，不能静默忽略
                 int eq = p.indexOf('=');
-                if (eq <= 0 || eq == p.length() - 1) {
-                    // 无法解析的谓词段：整条视为无效，交由调用方 warn
+                if (eq > 0 && eq < p.length() - 1) {
+                    // 新谓词：prop=value
+                    String name = p.substring(0, eq).trim().toLowerCase(Locale.ROOT);
+                    String value = p.substring(eq + 1).trim();
+                    if (!isValidIdentifier(name) || !isValidPredicateValue(value)) return null;
+                    predicates.computeIfAbsent(name, k -> new ArrayList<>()).add(value);
+                } else if (eq < 0) {
+                    // 逗号后的裸值：追加到上一个谓词的允许值列表（age=7,8）
+                    if (!isValidPredicateValue(p)) return null;
+                    Map.Entry<String, List<String>> last = null;
+                    for (Map.Entry<String, List<String>> e : predicates.entrySet()) last = e;
+                    if (last == null) return null; // 没有可归属的谓词名 → 整条无效
+                    last.getValue().add(p);
+                } else {
+                    // 缺名或缺值 / 多个等号：整条视为无效，交由调用方 warn
                     return null;
                 }
-                predicates.put(p.substring(0, eq).trim().toLowerCase(Locale.ROOT),
-                    p.substring(eq + 1).trim());
             }
         }
 
-        return new BlockMatch(canonicalBlockKey(namespace + ":" + path), null, predicates);
+        String key = canonicalBlockKey(namespace + ":" + path);
+        return key == null ? null : new BlockMatch(key, null, predicates);
+    }
+
+    /** 方块/属性名允许字符；空串或含冒号、等号、逗号、空白的标识符一律无效。 */
+    private static boolean isValidIdentifier(String s) {
+        if (s == null || s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '_' || c == '-' || c == '.' || c == '/')) return false;
+        }
+        return true;
+    }
+
+    /** 谓词取值：非空，且不能含会改变语法的字符（= , : 空白）。 */
+    private static boolean isValidPredicateValue(String s) {
+        if (s == null || s.isEmpty()) return false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '=' || c == ',' || c == ':' || Character.isWhitespace(c)) return false;
+        }
+        return true;
     }
 
     /**
@@ -271,7 +331,7 @@ public final class CtmRuleSupport {
 
     private static void addFaceTokens(Set<String> out, String raw) {
         boolean sidesSeen = false;
-        for (String token : raw.split("\\s+")) {
+        for (String token : raw.split("[\\s,]+")) {
             String face = token.trim();
             if (face.isEmpty()) continue;
             switch (face) {
@@ -307,7 +367,7 @@ public final class CtmRuleSupport {
         String s = raw.trim();
         if (s.isEmpty() || "-1".equals(s)) return null; // 调用方按“不限制”处理
         List<Integer> out = new ArrayList<>();
-        for (String part : s.split("\\s+")) {
+        for (String part : s.split("[\\s,]+")) {
             part = part.trim();
             if (part.isEmpty()) continue;
             int dash = part.indexOf('-');
@@ -336,6 +396,132 @@ public final class CtmRuleSupport {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    // ======================= 高度 / biome 环境过滤 =======================
+
+    /** 高度区间（含端点），用于 {@code height/heights/minHeight/maxHeight} 过滤。 */
+    public static final class HeightRange {
+        public final int min;
+        public final int max;
+
+        public HeightRange(int min, int max) {
+            this.min = min;
+            this.max = max;
+        }
+
+        public boolean contains(int y) {
+            return y >= min && y <= max;
+        }
+
+        @Override
+        public String toString() {
+            return min + "-" + max;
+        }
+    }
+
+    /**
+     * 解析 OptiFine 高度过滤：{@code height=0-63}、{@code heights=0-63 100-127}、
+     * {@code minHeight=0}、{@code maxHeight=63}。
+     *
+     * <p>返回 {@code null} 表示“无高度限制”（属性缺失/空白）。语法错误也返回 null，
+     * 但加载器对语法错误采取 fail-closed（整条规则跳过），见
+     * {@link CtmPropertiesLoader}。多个区间取并集。
+     *
+     * @param raw {@code height}/{@code heights}/{@code minHeight-maxHeight} 合并后的原始值
+     */
+    public static List<HeightRange> parseHeightRanges(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty()) return null;
+        List<HeightRange> out = new ArrayList<>();
+        for (String part : s.split("[\\s,]+")) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+            int dash = part.indexOf('-');
+            if (dash > 0) {
+                Integer a = parseIntOrNull(part.substring(0, dash));
+                Integer b = parseIntOrNull(part.substring(dash + 1));
+                if (a == null || b == null) return null;
+                if (a > b) { int t = a; a = b; b = t; }
+                out.add(new HeightRange(a, b));
+            } else {
+                Integer v = parseIntOrNull(part);
+                if (v == null) return null;
+                out.add(new HeightRange(v, v));
+            }
+        }
+        return out.isEmpty() ? null : out;
+    }
+
+    /** 由独立的 minHeight / maxHeight 属性合并出高度区间（任一缺失按该侧无限制）。 */
+    public static List<HeightRange> parseMinMaxHeight(String minRaw, String maxRaw) {
+        Integer min = minRaw == null || minRaw.trim().isEmpty() ? null : parseIntOrNull(minRaw);
+        Integer max = maxRaw == null || maxRaw.trim().isEmpty() ? null : parseIntOrNull(maxRaw);
+        if (minRaw != null && !minRaw.trim().isEmpty() && min == null) return null; // 语法错误
+        if (maxRaw != null && !maxRaw.trim().isEmpty() && max == null) return null;
+        if (min == null && max == null) return null;
+        int lo = min == null ? Integer.MIN_VALUE : min;
+        int hi = max == null ? Integer.MAX_VALUE : max;
+        if (lo > hi) return null;
+        return Collections.singletonList(new HeightRange(lo, hi));
+    }
+
+    /**
+     * biome 过滤器：包含项（普通 token）与排除项（{@code !} 前缀）。
+     * 两者都规范化到同一套键（小写、缺省命名空间、去 {@code .png}）。
+     */
+    public static final class BiomeFilter {
+        public final Set<String> included;
+        public final Set<String> excluded;
+
+        BiomeFilter(Set<String> included, Set<String> excluded) {
+            this.included = Collections.unmodifiableSet(included);
+            this.excluded = Collections.unmodifiableSet(excluded);
+        }
+
+        public boolean isEmpty() {
+            return included.isEmpty() && excluded.isEmpty();
+        }
+    }
+
+    /**
+     * 解析 biome 名称列表（空格或逗号分隔），规范化为小写、去 {@code .png}，
+     * 缺省命名空间补 {@code minecraft:}。返回 null 表示“无 biome 限制”；
+     * 空 token 忽略。
+     */
+    public static Set<String> parseBiomes(String raw) {
+        BiomeFilter filter = parseBiomeFilter(raw);
+        return filter == null ? null : new LinkedHashSet<>(filter.included);
+    }
+
+    /**
+     * 解析 biome 过滤器。语义与 OptiFine 一致：<b>前导 {@code !} 作用于整个列表</b>——
+     * {@code !desert savanna} 表示同时排除 desert 与 savanna，而不是“包含 savanna、
+     * 排除 desert”的混合写法（不发明混合语法）。没有前导 {@code !} 时全部为包含项。
+     *
+     * @return null 表示无有效条目（属性缺失/空白/仅有一个裸 {@code !}）
+     */
+    public static BiomeFilter parseBiomeFilter(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        if (s.isEmpty()) return null;
+        boolean negateAll = s.startsWith("!");
+        if (negateAll) s = s.substring(1).trim();
+        if (s.isEmpty()) return null;
+        Set<String> included = new LinkedHashSet<>();
+        Set<String> excluded = new LinkedHashSet<>();
+        for (String part : s.split("[\\s,]+")) {
+            String b = part.trim();
+            if (b.isEmpty()) continue;
+            // token 内的 ! 既不是合法 biome 名，也不是前缀语法：按写坏处理
+            if (b.indexOf('!') >= 0) return null;
+            String key = canonicalBlockKey(b.toLowerCase(Locale.ROOT));
+            if (key == null) return null;
+            (negateAll ? excluded : included).add(key);
+        }
+        if (included.isEmpty() && excluded.isEmpty()) return null;
+        return new BiomeFilter(included, excluded);
     }
 
     // ======================= connect =======================

@@ -1,7 +1,7 @@
 package team.celeritasctm;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.resources.SimpleReloadableResourceManager;
+import net.minecraftforge.client.event.TextureStitchEvent;
 import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.Mod.EventHandler;
@@ -64,16 +64,23 @@ public class CeleritasCTM {
 
         MinecraftForge.EVENT_BUS.register(this);
 
-        // 在精灵注册前就加载CTM属性
-        try {
-            if (Minecraft.getMinecraft().getResourceManager() != null) {
-                CtmPropertiesLoader.loadAll(Minecraft.getMinecraft().getResourceManager());
-            }
-        } catch (Exception e) {
-            logger.error("Failed to load CTM properties: {}", e.getMessage());
-        }
+        // 不在此处加载规则：方块图集首次缝合时 TextureStitchEvent.Pre 必定先触发
+        // （见 onTextureStitchPre），那才是唯一且与图集同源的重载边界。
+    }
 
-        logger.info("  CTM properties loaded: {}", CtmPropertiesLoader.getProperties().size());
+    /**
+     * 方块图集缝合前重建 CTM 规则并清理旧缓存（唯一重载边界）。
+     *
+     * <p>{@code TextureStitchEvent.Pre} 在 {@code TextureMap.loadSprites} 中、
+     * {@code loadTextureAtlas}（{@code MixinTextureMapExtended} 注入 CTM 瓦片处）之前触发，
+     * 启动 / F3+T / 切换资源包都会经过。只处理 Block 图集。
+     */
+    @SubscribeEvent
+    public void onTextureStitchPre(TextureStitchEvent.Pre event) {
+        Minecraft mc = Minecraft.getMinecraft();
+        if (mc == null || mc.getTextureMapBlocks() == null) return;
+        if (event.getMap() != mc.getTextureMapBlocks()) return;
+        CTMPackReloadListener.onBlockAtlasStitchPre(mc.getResourceManager());
     }
 
     /**
@@ -100,11 +107,9 @@ public class CeleritasCTM {
     public void postInit(FMLPostInitializationEvent event) {
         logger.info("=== CeleritasCTM post-init ===");
 
-        // 注册资源重载监听器
-        if (Minecraft.getMinecraft().getResourceManager() instanceof SimpleReloadableResourceManager) {
-            ((SimpleReloadableResourceManager) Minecraft.getMinecraft()
-                .getResourceManager()).registerReloadListener(CTMPackReloadListener.INSTANCE);
-        }
+        // 不注册 IResourceManagerReloadListener：它总是晚于方块图集缝合回调，
+        // 会造成 postInit 一次「图集已缝合后才重载」的重复加载。
+        // 重载统一由 onTextureStitchPre 在图集缝合前处理。
 
         logger.info("=== CeleritasCTM ready. {} CTM properties loaded ===",
             CtmPropertiesLoader.getProperties().size());

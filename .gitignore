@@ -18,6 +18,7 @@ build/
 out/
 bin/
 run/
+logs/
 
 # OS
 .DS_Store

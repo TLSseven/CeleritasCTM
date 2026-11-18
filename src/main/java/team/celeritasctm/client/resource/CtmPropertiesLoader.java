@@ -37,7 +37,53 @@ import java.util.zip.ZipFile;
  */
 public class CtmPropertiesLoader {
 
+    /**
+     * 不可变快照：规则列表与两个索引作为一个整体发布。
+     * 重载期间只构建新快照，绝不半途修改正在被渲染线程读取的旧快照。
+     */
+    public static final class RuleSnapshot {
+        public final List<CtmProperties> properties;
+        public final Map<String, List<CtmProperties>> tileIndex;
+        public final Map<String, List<CtmProperties>> blockIndex;
+        public final CtmProperties glassRule;
+        /** 含未解析数字 ID 的规则：索引构建时注册表尚不可用时在此兜底（查询期按方块 ID 比较） */
+        final List<CtmProperties> deferredNumericRules;
+
+        RuleSnapshot(List<CtmProperties> properties,
+                     Map<String, List<CtmProperties>> tileIndex,
+                     Map<String, List<CtmProperties>> blockIndex,
+                     CtmProperties glassRule,
+                     List<CtmProperties> deferredNumericRules) {
+            this.properties = Collections.unmodifiableList(new ArrayList<>(properties));
+            this.tileIndex = Collections.unmodifiableMap(deepFreeze(tileIndex));
+            this.blockIndex = Collections.unmodifiableMap(deepFreeze(blockIndex));
+            this.glassRule = glassRule;
+            this.deferredNumericRules = Collections.unmodifiableList(new ArrayList<>(deferredNumericRules));
+        }
+
+        private static Map<String, List<CtmProperties>> deepFreeze(Map<String, List<CtmProperties>> src) {
+            Map<String, List<CtmProperties>> out = new LinkedHashMap<>();
+            for (Map.Entry<String, List<CtmProperties>> e : src.entrySet()) {
+                out.put(e.getKey(), Collections.unmodifiableList(new ArrayList<>(e.getValue())));
+            }
+            return out;
+        }
+
+        static RuleSnapshot empty() {
+            return new RuleSnapshot(Collections.<CtmProperties>emptyList(),
+                Collections.<String, List<CtmProperties>>emptyMap(),
+                Collections.<String, List<CtmProperties>>emptyMap(), null,
+                Collections.<CtmProperties>emptyList());
+        }
+    }
+
+    /** 当前已发布的不可变快照（volatile：重载线程写、渲染线程读） */
+    private static volatile RuleSnapshot snapshot = RuleSnapshot.empty();
+
+    // 构建期的工作副本（仅重载线程访问；发布后即丢弃）
     private static final List<CtmProperties> PROPERTIES = new ArrayList<>();
+    // 索引构建时仍有未解析数字 ID 的规则（查询期作为兜底）
+    private static final List<CtmProperties> DEFERRED_NUMERIC_RULES = new ArrayList<>();
     // 清理后的纹理名 → 属性列表（含 matchTiles 的规则；列表按 packPriority 顺序）
     private static final Map<String, List<CtmProperties>> TILE_INDEX = new HashMap<>();
     // 规范化方块键（namespace:path，小写）→ 属性列表（纯 matchBlocks 的规则）
@@ -52,11 +98,17 @@ public class CtmPropertiesLoader {
     private static String currentPackName;
     // 当前重载使用的资源管理器（仅在重复 resourceId 时用于实证查询）
     private static IResourceManager activeResourceManager;
-    private static boolean loaded = false;
 
     // 内置连接玻璃规则（mod jar 内 tiles 0-46，见 assets/celeritasctm/mcpatcher/ctm/connected_glass/）。
-    // 无色玻璃（blocks/glass）经 findMatch 命中；染色玻璃在 CtmBakedModel 手动走此规则。
-    public static CtmProperties GLASS_RULE = null;
+    // 只作为<b>普通规则全部未命中后的回退</b>注入；也绝不把资源包提供的 glass 规则
+    // 当作全局内置模板暴露（资源包规则由 findMatch 正常命中）。
+    // 通过 {@link #getGlassRule()} 读取，保证与同一份快照一致。
+    /**
+     * @deprecated 仅为兼容旧调用点保留的只读别名，值恒等于 {@link #getGlassRule()}
+     *             （永远是内置回退对象，绝不会是资源包规则）。新代码请用 {@link #getGlassRule()}。
+     */
+    @Deprecated
+    public static volatile CtmProperties GLASS_RULE = null;
 
     /** 一次扫描的来源描述 */
     private static final class PackSource {
@@ -71,10 +123,17 @@ public class CtmPropertiesLoader {
         }
     }
 
-    public static void loadAll(IResourceManager resourceManager) {
+    /**
+     * 扫描并构建规则快照。方法整体同步：重载线程串行执行，避免工作副本被并发清空；
+     * 渲染线程只读 {@link #snapshot}，不受构建过程影响。构建/发布期间若抛异常，
+     * 已发布的旧快照保持有效（绝不中途发布半成品）。
+     */
+    public static synchronized void loadAll(IResourceManager resourceManager) {
+        // 工作副本只在重载线程使用；已发布的旧快照继续服务渲染线程，直到新快照构建完成。
         PROPERTIES.clear();
         TILE_INDEX.clear();
         BLOCK_INDEX.clear();
+        DEFERRED_NUMERIC_RULES.clear();
         SEEN_IDS.clear();
         WARNED_PROPERTIES.clear();
         CANDIDATE_PACK_NAMES.clear();
@@ -116,17 +175,27 @@ public class CtmPropertiesLoader {
                     }
                 }
             }
-        } catch (Exception e) {
-            CeleritasCTM.logger.error("Error scanning resource packs: {}", e.getMessage(), e);
-        }
 
-        Collections.sort(PROPERTIES);
-        rebuildIndex();
-        loaded = true;
-        // 补丁必须在 rebuildIndex 之后（否则 TILE_INDEX 被清空）
-        injectVanillaIronBarsPatch();
-        injectVanillaGlassPatch();
+            Collections.sort(PROPERTIES);
+            rebuildIndex();
+            // 内置回退：只补充普通规则未覆盖的场景，绝不覆盖资源包自带规则。
+            CtmProperties glass = injectVanillaGlassPatch();
+            // 原子发布：此刻起渲染线程看到的是完整的新规则+索引。
+            publishSnapshot(glass);
+        } catch (Throwable t) {
+            // 构建失败：保留上一个有效快照，不做任何发布。
+            CeleritasCTM.logger.error("CTM: rule build failed - keeping previous snapshot: {}", t.toString(), t);
+            return;
+        }
         CeleritasCTM.logger.info("=== CTM Properties Loader: Total {} CTM properties loaded ===", totalLoaded);
+    }
+
+    /** 把工作副本冻结为新快照并原子发布 */
+    private static void publishSnapshot(CtmProperties glassRule) {
+        RuleSnapshot next =
+            new RuleSnapshot(PROPERTIES, TILE_INDEX, BLOCK_INDEX, glassRule, DEFERRED_NUMERIC_RULES);
+        snapshot = next;
+        GLASS_RULE = next.glassRule; // 兼容别名：与快照同一对象，且只可能是内置回退
     }
 
     /**
@@ -142,13 +211,21 @@ public class CtmPropertiesLoader {
      */
     private static List<PackSource> collectPackSources() {
         List<PackSource> out = new ArrayList<>();
-        File resourcepacksDir = new File(Minecraft.getMinecraft().gameDir, "resourcepacks");
 
         ResourcePackRepository repo = null;
         try {
             repo = Minecraft.getMinecraft().getResourcePackRepository();
         } catch (Throwable t) {
             repo = null;
+        }
+        // 优先使用仓库自身的 resourcepacks 目录（与 vanilla 完全一致）；
+        // 仓库不可用时退回 gameDir/resourcepacks。
+        File resourcepacksDir;
+        try {
+            resourcepacksDir = repo == null ? new File(Minecraft.getMinecraft().gameDir, "resourcepacks")
+                : repo.getDirResourcepacks();
+        } catch (Throwable t) {
+            resourcepacksDir = new File(Minecraft.getMinecraft().gameDir, "resourcepacks");
         }
 
         if (repo == null) {
@@ -190,8 +267,9 @@ public class CtmPropertiesLoader {
             CtmRuleSupport.priorityForEnabledStack(enabledNames);
         for (CtmRuleSupport.PackSourceInfo info : stack) {
             String packName = info.name;
+            // 1.12.2 getResourcePackName() 就是文件/文件夹的 File.getName()：
+            // 精确匹配，不做前缀/后缀猜测（避免 Foo 目录与 Foo.zip 互相别名）。
             File file = byName.get(packName);
-            if (file == null) file = byName.get(packName + ".zip");
             if (file == null) {
                 CeleritasCTM.logger.warn(
                     "CTM: enabled pack '{}' not found under resourcepacks/ (ignored)", packName);
@@ -203,18 +281,14 @@ public class CtmPropertiesLoader {
         return out;
     }
 
-    /** 仅用于发现文件（不参与优先级）；键为文件名与去掉 .zip 的名字 */
+    /** 仅用于发现文件（不参与优先级）；键为精确文件名 */
     private static Map<String, File> indexResourcepackFiles(File dir) {
         Map<String, File> map = new HashMap<>();
         if (dir == null || !dir.isDirectory()) return map;
         File[] files = dir.listFiles();
         if (files == null) return map;
         for (File file : files) {
-            String name = file.getName();
-            map.put(name, file);
-            if (name.toLowerCase(Locale.ROOT).endsWith(".zip")) {
-                map.put(name.substring(0, name.length() - 4), file);
-            }
+            map.put(file.getName(), file);
         }
         return map;
     }
@@ -246,7 +320,12 @@ public class CtmPropertiesLoader {
         if (resourceManager == null || resourceId == null) return null;
         try {
             IResource resource = resourceManager.getResource(resourceId);
-            return resource == null ? null : resource.getResourcePackName();
+            if (resource == null) return null;
+            try {
+                return resource.getResourcePackName();
+            } finally {
+                resource.close(); // 修复资源泄漏：查询后必须关闭
+            }
         } catch (Throwable t) {
             // 未找到 / 命名空间不存在 / 管理器尚未就绪：不据此否决任何规则
             return null;
@@ -254,77 +333,112 @@ public class CtmPropertiesLoader {
     }
 
     /**
-     * 注入补丁规则：原版铁栅栏（minecraft:iron_bars）的 CTM 规则。
+     * 注入内置连接玻璃规则（method=ctm, tiles=0-46，位于本 mod jar 的
+     * assets/celeritasctm/mcpatcher/ctm/connected_glass/）。
      *
-     * <p>Conquest 资源包覆盖了原版 iron_bars.png：杆画在贴图 x9-13/x20-24
-     * （对应 UV 4.5-6 / 9-10.5），而原版铁栅栏模型（iron_bars_post/cap 等）
-     * 的 quad 采样 UV 7-9（贴图 x14-18）——恰好落在透明区，导致无连接时
-     * 柱子完全不可见。Conquest 未给原版铁栅栏提供任何规则或模型覆盖。
-     *
-     * <p>补丁：给原版 iron_bars 注入 Conquest 自带 iron_fence 的 CTM 规则
-     * （tiles 1-48），其贴图采样区 x14-18 有杆（Conquest ironbar 方块同款），
-     * 恢复可见并获得连接纹理。规则在 rebuildIndex 之后注入索引，不影响其他规则。
+     * <p>这是<b>通用回退</b>，不是资源包兼容补丁：
+     * <ul>
+     *   <li>只匹配原版精确纹理名 {@code blocks/glass}（不加通配，不碰染色玻璃或
+     *       其它 mod 的玻璃类方块）；染色玻璃由渲染端用同一内置规则单独合成。</li>
+     *   <li>内置规则在 {@link #findMatch} 中排在所有资源包规则之后（普通规则优先）。</li>
+     *   <li>返回的对象只用于回退（内置瓦片）；资源包自己的 glass 规则永远不会被
+     *       提升为全局模板，也不会在此函数返回。</li>
+     *   <li>瓦片资产不存在时不注入，返回 null。</li>
+     * </ul>
      */
-    private static void injectVanillaIronBarsPatch() {
+    private static CtmProperties injectVanillaGlassPatch() {
         try {
+            if (!resourceExists(new ResourceLocation("celeritasctm",
+                    "mcpatcher/ctm/connected_glass/0.png"))) {
+                CeleritasCTM.logger.info(
+                    "CTM: built-in connected glass tiles not present - skipped glass fallback");
+                return null;
+            }
             ResourceLocation patchId =
-                new ResourceLocation("minecraft", "mcpatcher/ctm/3_decoration/2_metal/fence/iron_fence/ironbar_vanilla_patch.properties");
-            CtmProperties props = new CtmProperties(patchId, "ctm", Integer.MAX_VALUE);
-            props.addMatchTile("blocks/iron_bars");
-            props.setTiles("1-48");
-            props.addFace("north"); props.addFace("south");
-            props.addFace("east"); props.addFace("west");
-            props.setConnect("material");
+                new ResourceLocation("celeritasctm", "mcpatcher/ctm/connected_glass/glass_vanilla_patch.properties");
+            CtmProperties props = new CtmProperties(patchId, "ctm", Integer.MIN_VALUE);
+            // 精确原版纹理名（显式命名空间）：不带命名空间的 blocks/glass 会命中
+            // 其它 mod 的同名纹理，必须避免。
+            props.addMatchTile("minecraft:blocks/glass");
+            props.setTiles("0-46");
+            props.setConnect("tile"); // 只与同种玻璃（minecraft:blocks/glass）连接
             props.setTileBased(true);
-            // 加入主列表 + 重建索引（prop 已 sort 后加入会乱序，这里直接补进 TILE_INDEX）
+            // 规则列表供瓦片精灵缝合（MixinTextureMapExtended）；tile 索引里也登记，
+            // 但 findMatch 的普通循环会显式跳过它，只在最后作为回退使用。
             PROPERTIES.add(props);
-            TILE_INDEX.computeIfAbsent("iron_bars", k -> new ArrayList<>()).add(props);
-            CeleritasCTM.logger.info("CTM: injected vanilla iron_bars CTM patch rule");
+            TILE_INDEX.computeIfAbsent("glass", k -> new ArrayList<>()).add(props);
+            CeleritasCTM.logger.info("CTM: built-in connected glass fallback rule available");
+            return props;
         } catch (Throwable t) {
-            CeleritasCTM.logger.warn("CTM: failed to inject iron_bars patch: {}", t.toString());
+            CeleritasCTM.logger.warn("CTM: failed to build glass fallback: {}", t.toString());
+            return null;
         }
     }
 
-    /**
-     * 注入内置连接玻璃规则（method=ctm, tiles=0-46，位于本 mod jar 的
-     * assets/celeritasctm/mcpatcher/ctm/connected_glass/）。玻璃是 CUTOUT 层，
-     * 现有 getQuads 逐 quad + ConnectionHandler.getMask + remapUV 直接生效。
-     * 关闭「无缝玻璃」配置后由 CtmBakedModel 跳过（规则本身保留，tile 缝合无成本）。
-     */
-    private static void injectVanillaGlassPatch() {
+    /** 当前资源管理器是否能解析该资源（重载时不可用则返回 false，保守跳过补丁） */
+    private static boolean resourceExists(ResourceLocation loc) {
+        IResourceManager rm = activeResourceManager;
+        if (rm == null) return false;
         try {
-            ResourceLocation patchId =
-                new ResourceLocation("celeritasctm", "mcpatcher/ctm/connected_glass/glass_vanilla_patch.properties");
-            CtmProperties props = new CtmProperties(patchId, "ctm", Integer.MAX_VALUE);
-            props.addMatchTile("blocks/glass");
-            props.setTiles("0-46");
-            props.setConnect("tile"); // 只与同种玻璃（blocks/glass）连接
-            props.setTileBased(true);
-            GLASS_RULE = props;
-            PROPERTIES.add(props);
-            TILE_INDEX.computeIfAbsent("glass", k -> new ArrayList<>()).add(props);
-            CeleritasCTM.logger.info("CTM: injected vanilla connected glass CTM patch rule");
-        } catch (Throwable t) {
-            CeleritasCTM.logger.warn("CTM: failed to inject glass patch: {}", t.toString());
+            IResource res = rm.getResource(loc);
+            if (res != null) {
+                res.close(); // 修复资源泄漏：探测后必须关闭
+                return true;
+            }
+        } catch (Throwable ignored) {
+            // 不存在 / 管理器未就绪
         }
+        return false;
     }
 
     /** 构建双索引：纹理名 → 规则列表（含 matchTiles），规范化方块键 → 规则列表（纯 matchBlocks） */
     private static void rebuildIndex() {
+        rebuildIndex(PROPERTIES);
+    }
+
+    private static void rebuildIndex(List<CtmProperties> source) {
         TILE_INDEX.clear();
         BLOCK_INDEX.clear();
-        // PROPERTIES 已按 packPriority 排序（高优先级在前），索引列表保持该顺序
-        for (CtmProperties prop : PROPERTIES) {
+        DEFERRED_NUMERIC_RULES.clear();
+        // source 已按 packPriority 排序（高优先级在前），索引列表保持该顺序
+        for (CtmProperties prop : source) {
             if (!prop.getMatchTilesClean().isEmpty()) {
                 for (String clean : prop.getMatchTilesClean()) {
                     TILE_INDEX.computeIfAbsent(clean, k -> new ArrayList<>()).add(prop);
                 }
-            } else if (prop.hasBlockMatches()) {
+                // matchTiles 规则也可能带未解析数字 ID 的 matchBlocks：
+                // 这类约束必须仍被尊重（不能因为走了纹理索引就跳过）。
+                if (prop.hasDeferredNumericIds()) DEFERRED_NUMERIC_RULES.add(prop);
+            } else if (prop.hasBlockMatches() || prop.hasDeferredNumericIds()) {
                 for (CtmRuleSupport.BlockMatch match : prop.getBlockMatches()) {
                     if (match.isNumeric() || match.getKey() == null) continue;
                     BLOCK_INDEX.computeIfAbsent(match.getKey(), k -> new ArrayList<>()).add(prop);
                 }
+                // 延迟数字 ID：若注册表此刻可用则解析并补入索引（只读查询，不改规则对象）
+                for (Integer id : prop.getDeferredNumericIds()) {
+                    String key = resolveNumericKey(id);
+                    if (key != null) {
+                        BLOCK_INDEX.computeIfAbsent(key, k -> new ArrayList<>()).add(prop);
+                    }
+                }
+                // 数字 ID 无法解析（注册表未就绪）时查询期按方块 ID 兜底
+                if (prop.hasDeferredNumericIds()) DEFERRED_NUMERIC_RULES.add(prop);
             }
+        }
+    }
+
+    /** 只读地把数字 ID 解析为规范化键；注册表不可用/无映射时返回 null（绝不当作空气方块） */
+    private static String resolveNumericKey(int id) {
+        try {
+            net.minecraft.block.Block block = net.minecraft.block.Block.getBlockById(id);
+            if (block == null) return null;
+            ResourceLocation rl = block.getRegistryName();
+            if (rl == null) return null;
+            // 注册表默认值（空气）不代表真实映射：ID 未注册时 getBlockById 返回空气，必须排除
+            if (block == net.minecraft.init.Blocks.AIR) return null;
+            return CtmRuleSupport.canonicalBlockKey(rl.toString());
+        } catch (Throwable t) {
+            return null;
         }
     }
 
@@ -390,18 +504,46 @@ public class CtmPropertiesLoader {
      */
     public static CtmProperties findMatch(String textureName, net.minecraft.block.state.IBlockState state,
                                           net.minecraft.util.EnumFacing side) {
-        return findMatchInternal(textureName, state, side);
+        return findMatch(textureName, state, side, null, null);
     }
 
-    private static CtmProperties findMatchInternal(String textureName,
-                                                   net.minecraft.block.state.IBlockState state,
-                                                   net.minecraft.util.EnumFacing side) {
-        // 1) matchTiles 规则
+    /**
+     * 带世界上下文的面感知匹配。若规则含 biome/height 限制，必须由调用方提供
+     * {@code world}/{@code pos}，否则这类规则 fail-closed（不匹配）。
+     * 无环境限制的规则行为与会话 3 参数版本完全一致。
+     */
+    public static CtmProperties findMatch(String textureName,
+                                          net.minecraft.block.state.IBlockState state,
+                                          net.minecraft.util.EnumFacing side,
+                                          net.minecraft.world.IBlockAccess world,
+                                          net.minecraft.util.math.BlockPos pos) {
+        return findMatchInSnapshot(snapshot, textureName, state, side, world, pos);
+    }
+
+    /**
+     * 在给定快照上执行匹配（包可见，供行为测试直接构造快照）。
+     *
+     * <p>优先级严格为：普通 matchTiles 规则 → 普通 matchBlocks 规则 →
+     * 延迟数字 ID 规则 → 最后才是内置玻璃回退。内置回退在 tile 索引里也会出现，
+     * 因此普通循环必须显式跳过它，否则它会抢在资源包方块规则之前命中。
+     */
+    static CtmProperties findMatchInSnapshot(RuleSnapshot snap,
+                                             String textureName,
+                                             net.minecraft.block.state.IBlockState state,
+                                             net.minecraft.util.EnumFacing side,
+                                             net.minecraft.world.IBlockAccess world,
+                                             net.minecraft.util.math.BlockPos pos) {
+        if (snap == null) return null;
+        EnvContext env = new EnvContext(world, pos);
+
+        // 1) matchTiles 规则（按 packPriority 排序，高优先级在前）。
+        //    跳过内置玻璃回退：它不是普通规则，只能在所有普通规则之后使用。
         if (textureName != null) {
-            List<CtmProperties> list = TILE_INDEX.get(CtmProperties.cleanTextureName(textureName));
+            List<CtmProperties> list = snap.tileIndex.get(CtmProperties.cleanTextureName(textureName));
             if (list != null) {
                 for (CtmProperties p : list) {
-                    if (p.matchesBlock(state) && p.matchesMetadata(state) && p.appliesTo(side)) {
+                    if (p == snap.glassRule) continue;
+                    if (p.matchesTile(textureName) && matchesContext(p, state, side, env)) {
                         return p;
                     }
                 }
@@ -411,17 +553,99 @@ public class CtmPropertiesLoader {
         if (state != null) {
             String key = CtmProperties.canonicalKeyOf(state);
             if (key != null) {
-                List<CtmProperties> list = BLOCK_INDEX.get(key);
+                List<CtmProperties> list = snap.blockIndex.get(key);
                 if (list != null) {
                     for (CtmProperties p : list) {
-                        if (p.matchesBlock(state) && p.matchesMetadata(state) && p.appliesTo(side)) {
+                        if (p == snap.glassRule) continue;
+                        if (matchesContext(p, state, side, env)) {
                             return p;
                         }
                     }
                 }
             }
         }
+        // 3) 注册表尚未就绪时未能进入方块索引的数字 ID 规则：查询期按方块 ID 兜底
+        for (CtmProperties p : snap.deferredNumericRules) {
+            if (p == snap.glassRule) continue;
+            if (!p.hasDeferredNumericIds()) continue;
+            if (!p.getMatchTilesClean().isEmpty() && !p.matchesTile(textureName)) continue;
+            if (matchesContext(p, state, side, env)) {
+                return p;
+            }
+        }
+        // 4) 内置玻璃回退：只有全部普通规则都未命中、且纹理确实是内置规则声明的那一张时才使用
+        CtmProperties glass = snap.glassRule;
+        if (glass != null
+                && textureName != null
+                && glass.matchesTile(textureName)
+                && matchesContext(glass, state, side, env)) {
+            return glass;
+        }
         return null;
+    }
+
+    /** 方块/元数据/高度/biome/面 的统一判定（不含纹理判定） */
+    private static boolean matchesContext(CtmProperties p, net.minecraft.block.state.IBlockState state,
+                                          net.minecraft.util.EnumFacing side, EnvContext env) {
+        return p.matchesBlock(state)
+            && p.matchesMetadata(state)
+            && p.matchesHeight(env.height())
+            // 无 biome 限制的规则绝不触发 biome 查询
+            && (!p.hasBiomeRestriction() || p.matchesBiomeKeys(env.biomeKeys()))
+            && p.appliesTo(side);
+    }
+
+    /** 一次匹配内的惰性环境上下文：height 总是可用，biome 只在必要时查询。 */
+    private static final class EnvContext {
+        private final net.minecraft.world.IBlockAccess world;
+        private final net.minecraft.util.math.BlockPos pos;
+        private List<String> biomeKeys;
+        private boolean biomeResolved;
+
+        EnvContext(net.minecraft.world.IBlockAccess world, net.minecraft.util.math.BlockPos pos) {
+            this.world = world;
+            this.pos = pos;
+        }
+
+        Integer height() {
+            return pos == null ? null : pos.getY();
+        }
+
+        List<String> biomeKeys() {
+            if (!biomeResolved) {
+                biomeKeys = biomeKeysAt(world, pos);
+                biomeResolved = true;
+            }
+            return biomeKeys;
+        }
+    }
+
+    /**
+     * 当前位置 biome 的候选键：注册名 + 实际显示名（旧版资源包常写显示名）。
+     * 两者都规范化后返回；无世界/坐标上下文或无法取得名字时返回 null。
+     * 不做任何“显示名 → 注册名”的硬编码映射，只比较两端实际存在的字符串。
+     */
+    private static List<String> biomeKeysAt(net.minecraft.world.IBlockAccess world,
+                                            net.minecraft.util.math.BlockPos pos) {
+        if (world == null || pos == null) return null;
+        try {
+            net.minecraft.world.biome.Biome biome = world.getBiome(pos);
+            if (biome == null) return null;
+            List<String> keys = new ArrayList<>(2);
+            ResourceLocation rl = biome.getRegistryName();
+            if (rl != null) {
+                String key = CtmRuleSupport.canonicalBlockKey(rl.toString());
+                if (key != null) keys.add(key);
+            }
+            String name = biome.getBiomeName();
+            if (name != null && !name.trim().isEmpty()) {
+                String key = CtmRuleSupport.canonicalBlockKey(name);
+                if (key != null && !keys.contains(key)) keys.add(key);
+            }
+            return keys.isEmpty() ? null : keys;
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private static int scanZipFile(File zipFile, int packPriority) {
@@ -531,18 +755,20 @@ public class CtmPropertiesLoader {
             String method = props.getProperty("method", "ctm").trim().toLowerCase(Locale.ROOT);
             CtmProperties ctm = new CtmProperties(resourceId, method, packPriority);
 
+            // properties 所在目录（相对路径解析与文件名回退共用）
+            String propsPath = resourceId.getPath();
+            String pathDir = propsPath.contains("/")
+                ? propsPath.substring(0, propsPath.lastIndexOf('/') + 1) : "";
+
             // matchTiles（支持相对路径 ./xxx.png，基于 properties 所在目录解析）
             String matchTilesRaw = props.getProperty("matchTiles", "");
             if (!matchTilesRaw.isEmpty()) {
-                String propsPath = resourceId.getPath();
-                String propsDir = propsPath.contains("/")
-                    ? propsPath.substring(0, propsPath.lastIndexOf('/') + 1) : "";
                 for (String tile : matchTilesRaw.split("\\s+")) {
                     String t = tile.trim();
                     if (t.isEmpty()) continue;
                     // 相对路径 → 完整路径（不含命名空间），如 ./81.png → mcpatcher/ctm/.../plastered_stone/81.png
                     if (t.startsWith("./")) {
-                        t = propsDir + t.substring(2);
+                        t = pathDir + t.substring(2);
                     }
                     ctm.addMatchTile(t);
                 }
@@ -562,28 +788,40 @@ public class CtmPropertiesLoader {
                         continue;
                     }
                     if (parsed.isNumeric()) {
-                        CtmRuleSupport.BlockMatch resolved = resolveNumericId(resourceId, parsed);
-                        if (resolved == null) continue; // 已在 resolveNumericId 内 warn
-                        ctm.addMatchBlockRecord(resolved.getKey());
-                        ctm.addBlockMatch(resolved);
+                        // 数字 ID 延迟解析：注册表不可用时保留裸 ID，绝不映射为空气；
+                        // 可用时立即解析为键。两条路径都由 hasBlockConstraint() 保证不从“有约束”退化为“无约束”。
+                        ctm.addMatchBlockRecord(t);
+                        ctm.addDeferredNumericId(parsed.getNumericId());
+                        String resolvedKey = resolveNumericKey(parsed.getNumericId());
+                        if (resolvedKey != null) {
+                            ctm.addBlockMatch(parsed.resolvedTo(resolvedKey));
+                        }
                     } else {
                         ctm.addMatchBlockRecord(t);
                         ctm.addBlockMatch(parsed);
                     }
                     anyValidToken = true;
                 }
-                if (!anyValidToken && ctm.getMatchTilesClean().isEmpty()) {
-                    CeleritasCTM.logger.warn("CTM: {} has no usable matchBlocks entries - rule skipped",
-                        resourceId);
+                if (!anyValidToken) {
+                    // 显式写了 matchBlocks 但无一有效：整条规则跳过。
+                    // 关键：即使 matchTiles 存在也不得放宽为“任意方块”，否则会把规则
+                    // 扩散到所有使用该纹理的方块（引入行为不属于该资源包）。
+                    CeleritasCTM.logger.warn(
+                        "CTM: {} has no usable matchBlocks entries - rule skipped (not widened)", resourceId);
                     return null;
                 }
             }
 
-            // OptiFine block<ID> 文件名机制：matchTiles/matchBlocks 都为空时，
-            // 若文件名是 block<数字>[后缀]（如 block171a.properties），自动匹配方块 ID。
-            // Conquest 的地毯规则（block171*.properties）依赖此机制。
-            if (ctm.getMatchTilesClean().isEmpty() && !ctm.hasBlockMatches()) {
-                addBlockIdMatch(ctm);
+            // OptiFine 文件名机制（通用回退，matchBlocks 缺省时才生效）：
+            // 1) block<数字>[后缀].properties → 匹配该数字 ID 的方块。即使文件里写了
+            //    matchTiles 也要加上这个方块约束（两条约束取交，不能因文件名被忽略而放宽）；
+            // 2) 没有 block<id> 文件名、也没有 matchTiles 时，用“文件名主干”精确作为纹理名
+            //    （如 planks.properties → 纹理 planks；planks2.properties → planks2）。
+            boolean hasExplicitBlockMatch = ctm.hasBlockMatches() || ctm.hasDeferredNumericIds();
+            if (!hasExplicitBlockMatch) {
+                if (!addBlockIdMatch(ctm) && ctm.getMatchTilesClean().isEmpty()) {
+                    addFilenameTileMatch(ctm, pathDir);
+                }
             }
 
             // tiles
@@ -628,6 +866,45 @@ public class CtmPropertiesLoader {
             try { ctm.setWidth(Integer.parseInt(props.getProperty("width", "1").trim())); } catch (NumberFormatException ignored) {}
             try { ctm.setHeight(Integer.parseInt(props.getProperty("height", "1").trim())); } catch (NumberFormatException ignored) {}
 
+            // 环境过滤：heights / minHeight / maxHeight / biomes（通用 OptiFine 键）。
+            // 注意：height= 是 repeat 的尺寸参数（见 width/height），此处不作为选择器解析。
+            // heights 优先：写了 heights 就不再合并 minHeight/maxHeight，
+            // 否则两组区间并集会把范围放宽（不应扩大规则命中面）。
+            String heightsRaw = props.getProperty("heights");
+            List<CtmRuleSupport.HeightRange> ranges = null;
+            if (heightsRaw != null && !heightsRaw.trim().isEmpty()) {
+                ranges = CtmRuleSupport.parseHeightRanges(heightsRaw);
+                if (ranges == null) {
+                    CeleritasCTM.logger.warn("CTM: {} has invalid heights '{}' - rule skipped",
+                        resourceId, heightsRaw);
+                    return null;
+                }
+            } else {
+                String minH = props.getProperty("minHeight");
+                String maxH = props.getProperty("maxHeight");
+                if ((minH != null && !minH.trim().isEmpty()) || (maxH != null && !maxH.trim().isEmpty())) {
+                    ranges = CtmRuleSupport.parseMinMaxHeight(minH, maxH);
+                    if (ranges == null) {
+                        CeleritasCTM.logger.warn("CTM: {} has invalid minHeight/maxHeight '{}/{}' - rule skipped",
+                            resourceId, minH, maxH);
+                        return null;
+                    }
+                }
+            }
+            ctm.setHeightRanges(ranges);
+
+            String biomesRaw = props.getProperty("biomes");
+            if (biomesRaw != null && !biomesRaw.trim().isEmpty()) {
+                CtmRuleSupport.BiomeFilter filter = CtmRuleSupport.parseBiomeFilter(biomesRaw);
+                if (filter == null) {
+                    CeleritasCTM.logger.warn("CTM: {} has invalid biomes '{}' - rule skipped",
+                        resourceId, biomesRaw);
+                    return null;
+                }
+                ctm.setBiomes(filter.included);
+                ctm.setBiomeExclusions(filter.excluded);
+            }
+
             // connect（合法值 block|tile|material|state；其余 fail-closed）
             String connectRaw = props.getProperty("connect", "").trim();
             if (!CtmRuleSupport.isValidConnect(connectRaw)) {
@@ -656,62 +933,81 @@ public class CtmPropertiesLoader {
     }
 
     /**
-     * 数字 Block ID 归一化：OptiFine 1.12.2 文档 {@code doc/ctm.properties:47}
-     * 规定 {@code matchBlocks=<list of block IDs 0-4095>}。
-     * 解析失败（返回 null 或注册名为 null）时 warn 并跳过该条，不得静默当成方块名。
+     * OptiFine block(数字ID) 文件名机制：规则文件名形如 block171a.properties
+     * （匹配 ID=171 的方块）时，通过 Block.getBlockById 反查 ID 得到注册名。
+     * 注册表不可用时保留裸数字 ID（延迟解析），不映射为空气。
+     *
+     * @return 是否识别出 block<id> 文件名（无论是否立即解析成功）
      */
-    private static CtmRuleSupport.BlockMatch resolveNumericId(ResourceLocation resourceId,
-                                                              CtmRuleSupport.BlockMatch numeric) {
-        int id = numeric.getNumericId();
+    private static boolean addBlockIdMatch(CtmProperties ctm) {
+        Integer blockId = parseBlockIdFromFileName(ctm.getResourceId().getPath());
+        if (blockId == null) return false;
+        String key = resolveNumericKey(blockId);
+        if (key != null) {
+            ctm.addMatchBlock(key);
+        } else {
+            // 注册表未就绪：保留裸 ID，重载后（注册表可用）再解析
+            ctm.addDeferredNumericId(blockId);
+        }
+        return true;
+    }
+
+    /**
+     * 从规则文件名解析 OptiFine {@code block<id>} 形式（纯函数，不查注册表）。
+     * 仅识别 {@code block} 前缀 + 至少一位数字，且数字必须落在 1-4095。
+     * 例如 {@code block171a.properties} → 171；{@code block.properties}/null → null。
+     */
+    static Integer parseBlockIdFromFileName(String path) {
+        if (path == null) return null;
+        int lastSlash = path.lastIndexOf('/');
+        String base = lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+        if (!base.startsWith("block")) return null;
+        int i = 5;
+        while (i < base.length() && Character.isDigit(base.charAt(i))) i++;
+        if (i == 5) return null;
         try {
-            net.minecraft.block.Block block = net.minecraft.block.Block.getBlockById(id);
-            if (block == null) {
-                CeleritasCTM.logger.warn("CTM: {} matchBlocks id {} resolves to no block (ignored)",
-                    resourceId, id);
-                return null;
-            }
-            ResourceLocation rl = block.getRegistryName();
-            if (rl == null) {
-                CeleritasCTM.logger.warn("CTM: {} matchBlocks id {} has no registry name (ignored)",
-                    resourceId, id);
-                return null;
-            }
-            return numeric.resolvedTo(rl.toString());
-        } catch (Throwable t) {
-            CeleritasCTM.logger.warn("CTM: {} failed to resolve matchBlocks id {}: {}",
-                resourceId, id, t.toString());
+            int id = Integer.parseInt(base.substring(5, i));
+            // 保留 0：显式 ID 0 仍是“有约束”（解析期拒绝映射为空气），不能退回文件名纹理匹配
+            return id >= 0 && id <= 4095 ? id : null;
+        } catch (NumberFormatException e) {
             return null;
         }
     }
 
+    /** 文件名主干（去掉目录、{@code .properties}）；不做任何后缀剥离。 */
+    static String filenameStem(String path) {
+        if (path == null) return "";
+        int lastSlash = path.lastIndexOf('/');
+        String stem = lastSlash >= 0 ? path.substring(lastSlash + 1) : path;
+        if (stem.endsWith(".properties")) stem = stem.substring(0, stem.length() - 11);
+        return stem;
+    }
+
     /**
-     * OptiFine block(数字ID) 文件名机制：规则文件名形如 block171a.properties
-     * （匹配 ID=171 的方块 minecraft:carpet）时，通过 Block.getBlockById
-     * 反查 ID 得到注册名，加入 matchBlocks。
-     * Conquest 的地毯规则（carpet 各颜色目录下的 block171*.properties）依赖此机制。
+     * 通用文件名匹配回退：规则既无 matchTiles 也无 matchBlocks 时，
+     * 用文件名主干（仅去掉 {@code .properties}）精确作为纹理名。
+     * 例如 {@code ctm/planks.properties} → {@code blocks/planks}，
+     * {@code ctm/planks2.properties} → {@code blocks/planks2}（不再剥掉数字后缀，
+     * 否则会把 planks2 误配到 planks 的所有方块上）。
+     *
+     * <p>仅当该纹理名确实存在于图集（资源管理器可解析对应 PNG）时才采用，
+     * 避免凭空扩大匹配面。
      */
-    private static void addBlockIdMatch(CtmProperties ctm) {
-        String fileName = ctm.getResourceId().getPath();
-        int lastSlash = fileName.lastIndexOf('/');
-        String base = lastSlash >= 0 ? fileName.substring(lastSlash + 1) : fileName;
-        if (!base.startsWith("block")) return;
-        int digitStart = 5;
-        int i = digitStart;
-        while (i < base.length() && Character.isDigit(base.charAt(i))) i++;
-        if (i == digitStart) return; // block 后无数字
-        try {
-            int blockId = Integer.parseInt(base.substring(digitStart, i));
-            net.minecraft.block.Block block = net.minecraft.block.Block.getBlockById(blockId);
-            if (block == null) {
-                CeleritasCTM.logger.warn("CTM: {} filename implies block id {} but no such block",
-                    ctm.getResourceId(), blockId);
-                return;
-            }
-            net.minecraft.util.ResourceLocation rl = block.getRegistryName();
-            if (rl == null) return;
-            ctm.addMatchBlock(rl.toString());
-        } catch (NumberFormatException ignored) {
+    private static void addFilenameTileMatch(CtmProperties ctm, String pathDir) {
+        String stem = filenameStem(ctm.getResourceId().getPath());
+        if (stem.isEmpty()) return;
+
+        // 候选纹理名：显式带命名空间、无命名空间（属主命名空间）
+        String ns = ctm.getResourceId().getNamespace();
+        String bare = "blocks/" + stem;
+        ResourceLocation probeOwn = new ResourceLocation(ns, "textures/" + bare + ".png");
+        ResourceLocation probeMc = new ResourceLocation("minecraft", "textures/" + bare + ".png");
+        if (resourceExists(probeOwn)) {
+            ctm.addMatchTile(ns.equals("minecraft") ? bare : ns + ":" + bare);
+        } else if (resourceExists(probeMc)) {
+            ctm.addMatchTile("minecraft:" + bare);
         }
+        // 都不存在：不猜测，保持无匹配 → addProperty 会跳过该规则
     }
 
     /** 同一个未知属性只 warn 一次（跨规则、跨重载去重由 WARNED_PROPERTIES 保证） */
@@ -724,11 +1020,20 @@ public class CtmPropertiesLoader {
     }
 
     public static List<CtmProperties> getProperties() {
-        return Collections.unmodifiableList(PROPERTIES);
+        return snapshot.properties;
+    }
+
+    /** 当前已发布的不可变快照（渲染线程每次重载后应重新获取） */
+    public static RuleSnapshot getSnapshot() {
+        return snapshot;
+    }
+
+    /** 当前玻璃规则（来自同一份快照，避免与规则列表不一致） */
+    public static CtmProperties getGlassRule() {
+        return snapshot.glassRule;
     }
 
     public static void reload(IResourceManager resourceManager) {
-        loaded = false;
         loadAll(resourceManager);
     }
 
