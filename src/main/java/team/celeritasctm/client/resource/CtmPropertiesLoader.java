@@ -534,16 +534,36 @@ public class CtmPropertiesLoader {
                                              net.minecraft.world.IBlockAccess world,
                                              net.minecraft.util.math.BlockPos pos) {
         if (snap == null) return null;
-        EnvContext env = new EnvContext(world, pos);
+        // ---- 一次请求内的惰性上下文（不跨调用缓存，避免脏状态）----
+        // 清理后的纹理名与命名空间只算一次，索引查找与每条候选共用；
+        // 规范化方块键只算一次（首次真正需要时）。
+        String cleanTexture = textureName == null ? null : CtmProperties.cleanTextureName(textureName);
+        String textureNamespace = textureName == null ? null : CtmProperties.namespaceOf(textureName);
+        EnvContext env = null;          // 仅在候选规则带 height/biome 限制时创建
+        String canonicalKey = null;     // 仅在候选规则带方块约束时计算
+        boolean canonicalKeyReady = false;
+        // 状态属性表：仅当候选规则真的带属性谓词时才构建，且一次请求内只构建一次
+        Map<String, String> stateProps = null;
+        boolean statePropsReady = false;
 
         // 1) matchTiles 规则（按 packPriority 排序，高优先级在前）。
         //    跳过内置玻璃回退：它不是普通规则，只能在所有普通规则之后使用。
         if (textureName != null) {
-            List<CtmProperties> list = snap.tileIndex.get(CtmProperties.cleanTextureName(textureName));
+            List<CtmProperties> list = snap.tileIndex.get(cleanTexture);
             if (list != null) {
                 for (CtmProperties p : list) {
                     if (p == snap.glassRule) continue;
-                    if (p.matchesTile(textureName) && matchesContext(p, state, side, env)) {
+                    if (!p.matchesTileClean(cleanTexture, textureNamespace)) continue;
+                    if (p.needsEnvironment() && env == null) env = new EnvContext(world, pos);
+                    if (state != null && p.hasBlockConstraint() && !canonicalKeyReady) {
+                        canonicalKey = CtmProperties.canonicalKeyOf(state);
+                        canonicalKeyReady = true;
+                    }
+                    if (p.hasBlockPropertyPredicates() && state != null && !statePropsReady) {
+                        stateProps = CtmProperties.statePropertyMap(state);
+                        statePropsReady = true;
+                    }
+                    if (matchesContext(p, state, side, env, canonicalKey, stateProps)) {
                         return p;
                     }
                 }
@@ -551,13 +571,21 @@ public class CtmPropertiesLoader {
         }
         // 2) matchBlocks 规则（无 matchTiles 时按规范化方块键匹配）
         if (state != null) {
-            String key = CtmProperties.canonicalKeyOf(state);
-            if (key != null) {
-                List<CtmProperties> list = snap.blockIndex.get(key);
+            if (!canonicalKeyReady) {
+                canonicalKey = CtmProperties.canonicalKeyOf(state);
+                canonicalKeyReady = true;
+            }
+            if (canonicalKey != null) {
+                List<CtmProperties> list = snap.blockIndex.get(canonicalKey);
                 if (list != null) {
                     for (CtmProperties p : list) {
                         if (p == snap.glassRule) continue;
-                        if (matchesContext(p, state, side, env)) {
+                        if (p.needsEnvironment() && env == null) env = new EnvContext(world, pos);
+                        if (p.hasBlockPropertyPredicates() && !statePropsReady) {
+                            stateProps = CtmProperties.statePropertyMap(state);
+                            statePropsReady = true;
+                        }
+                        if (matchesContext(p, state, side, env, canonicalKey, stateProps)) {
                             return p;
                         }
                     }
@@ -568,8 +596,17 @@ public class CtmPropertiesLoader {
         for (CtmProperties p : snap.deferredNumericRules) {
             if (p == snap.glassRule) continue;
             if (!p.hasDeferredNumericIds()) continue;
-            if (!p.getMatchTilesClean().isEmpty() && !p.matchesTile(textureName)) continue;
-            if (matchesContext(p, state, side, env)) {
+            if (!p.getMatchTilesClean().isEmpty() && !p.matchesTileClean(cleanTexture, textureNamespace)) continue;
+            if (p.needsEnvironment() && env == null) env = new EnvContext(world, pos);
+            if (state != null && p.hasBlockConstraint() && !canonicalKeyReady) {
+                canonicalKey = CtmProperties.canonicalKeyOf(state);
+                canonicalKeyReady = true;
+            }
+            if (p.hasBlockPropertyPredicates() && state != null && !statePropsReady) {
+                stateProps = CtmProperties.statePropertyMap(state);
+                statePropsReady = true;
+            }
+            if (matchesContext(p, state, side, env, canonicalKey, stateProps)) {
                 return p;
             }
         }
@@ -577,19 +614,39 @@ public class CtmPropertiesLoader {
         CtmProperties glass = snap.glassRule;
         if (glass != null
                 && textureName != null
-                && glass.matchesTile(textureName)
-                && matchesContext(glass, state, side, env)) {
-            return glass;
+                && glass.matchesTileClean(cleanTexture, textureNamespace)) {
+            if (glass.needsEnvironment() && env == null) env = new EnvContext(world, pos);
+            if (state != null && glass.hasBlockConstraint() && !canonicalKeyReady) {
+                canonicalKey = CtmProperties.canonicalKeyOf(state);
+                canonicalKeyReady = true;
+            }
+            if (glass.hasBlockPropertyPredicates() && state != null && !statePropsReady) {
+                stateProps = CtmProperties.statePropertyMap(state);
+                statePropsReady = true;
+            }
+            if (matchesContext(glass, state, side, env, canonicalKey, stateProps)) {
+                return glass;
+            }
         }
         return null;
     }
 
-    /** 方块/元数据/高度/biome/面 的统一判定（不含纹理判定） */
+    /**
+     * 方块/元数据/高度/biome/面 的统一判定（不含纹理判定）。
+     *
+     * @param env         惰性环境上下文；仅当规则带 height/biome 限制时才由调用方创建
+     * @param canonicalKey 调用方已计算好的规范化方块键；规则无方块约束时不使用
+     * @param stateProps  调用方已构建的状态属性表；规则无属性谓词时为 null
+     */
     private static boolean matchesContext(CtmProperties p, net.minecraft.block.state.IBlockState state,
-                                          net.minecraft.util.EnumFacing side, EnvContext env) {
-        return p.matchesBlock(state)
+                                          net.minecraft.util.EnumFacing side, EnvContext env,
+                                          String canonicalKey, Map<String, String> stateProps) {
+        // 不变量保护：规则需要环境上下文时调用方必须已创建 env。
+        // 若漏建则 fail-closed（绝不把 height/biome 限制当作“无限制”）。
+        if (p.needsEnvironment() && env == null) return false;
+        return p.matchesBlock(state, canonicalKey, stateProps)
             && p.matchesMetadata(state)
-            && p.matchesHeight(env.height())
+            && p.matchesHeight(env == null ? null : env.height())
             // 无 biome 限制的规则绝不触发 biome 查询
             && (!p.hasBiomeRestriction() || p.matchesBiomeKeys(env.biomeKeys()))
             && p.appliesTo(side);

@@ -99,6 +99,16 @@ public final class ConnectionHandler {
     public static int getMask(IBlockAccess world, BlockPos pos, EnumFacing face,
                               CtmProperties props, TextureAtlasSprite quadSprite) {
         IBlockState self = world.getBlockState(pos);
+        return getMask(world, pos, self, face, props, quadSprite);
+    }
+
+    /**
+     * 8 方向连接掩码：{@code self} 由调用方预先读取（同一次渲染调用内多个 quad
+     * 共用同一个 self state，避免逐 quad 重复 {@code world.getBlockState(pos)}）。
+     * 语义与 {@link #getMask(IBlockAccess, BlockPos, EnumFacing, CtmProperties, TextureAtlasSprite)} 完全一致。
+     */
+    public static int getMask(IBlockAccess world, BlockPos pos, IBlockState self, EnumFacing face,
+                              CtmProperties props, TextureAtlasSprite quadSprite) {
         EnumFacing[] dirs = FACE_DIRS[face.ordinal()];
         int mask = 0;
         for (int i = 0; i < 4; i++) {
@@ -122,6 +132,13 @@ public final class ConnectionHandler {
     public static int getHorizontalMask(IBlockAccess world, BlockPos pos, EnumFacing face,
                                         CtmProperties props, TextureAtlasSprite quadSprite) {
         IBlockState self = world.getBlockState(pos);
+        return getHorizontalMask(world, pos, self, face, props, quadSprite);
+    }
+
+    /** 水平掩码：{@code self} 由调用方预先读取（语义同上）。 */
+    public static int getHorizontalMask(IBlockAccess world, BlockPos pos, IBlockState self,
+                                        EnumFacing face, CtmProperties props,
+                                        TextureAtlasSprite quadSprite) {
         EnumFacing[] dirs = FACE_DIRS[face.ordinal()];
         int mask = 0;
         if (shouldConnect(world, pos, self, props, quadSprite, pos.offset(dirs[0]), face)) mask |= 1;
@@ -133,6 +150,13 @@ public final class ConnectionHandler {
     public static int getVerticalMask(IBlockAccess world, BlockPos pos, EnumFacing face,
                                       CtmProperties props, TextureAtlasSprite quadSprite) {
         IBlockState self = world.getBlockState(pos);
+        return getVerticalMask(world, pos, self, face, props, quadSprite);
+    }
+
+    /** 垂直掩码：{@code self} 由调用方预先读取（语义同上）。 */
+    public static int getVerticalMask(IBlockAccess world, BlockPos pos, IBlockState self,
+                                      EnumFacing face, CtmProperties props,
+                                      TextureAtlasSprite quadSprite) {
         EnumFacing[] dirs = FACE_DIRS[face.ordinal()];
         int mask = 0;
         if (shouldConnect(world, pos, self, props, quadSprite, pos.offset(dirs[1]), face)) mask |= 1;
@@ -147,6 +171,12 @@ public final class ConnectionHandler {
     public static int getVerticalMaskWorld(IBlockAccess world, BlockPos pos,
                                            CtmProperties props, TextureAtlasSprite quadSprite) {
         IBlockState self = world.getBlockState(pos);
+        return getVerticalMaskWorld(world, pos, self, props, quadSprite);
+    }
+
+    /** 世界空间垂直掩码：{@code self} 由调用方预先读取（语义同上）。 */
+    public static int getVerticalMaskWorld(IBlockAccess world, BlockPos pos, IBlockState self,
+                                           CtmProperties props, TextureAtlasSprite quadSprite) {
         int mask = 0;
         if (shouldConnect(world, pos, self, props, quadSprite, pos.down(), EnumFacing.UP)) mask |= 1;
         if (shouldConnect(world, pos, self, props, quadSprite, pos.up(), EnumFacing.UP)) mask |= 2;
@@ -157,21 +187,43 @@ public final class ConnectionHandler {
     public static boolean isConnected(IBlockAccess world, BlockPos pos,
                                       CtmProperties props, TextureAtlasSprite quadSprite, EnumFacing facing) {
         IBlockState self = world.getBlockState(pos);
+        return isConnected(world, pos, self, props, quadSprite, facing);
+    }
+
+    /** 单个方向连接检测：{@code self} 由调用方预先读取（语义同上）。 */
+    public static boolean isConnected(IBlockAccess world, BlockPos pos, IBlockState self,
+                                      CtmProperties props, TextureAtlasSprite quadSprite,
+                                      EnumFacing facing) {
         return shouldConnect(world, pos, self, props, quadSprite, pos.offset(facing), facing);
     }
 
     private static boolean shouldConnect(IBlockAccess world, BlockPos pos, IBlockState self,
                                          CtmProperties props, TextureAtlasSprite quadSprite,
                                          BlockPos otherPos, EnumFacing face) {
-        boolean connected = primaryConnect(world, self, props, quadSprite, otherPos, face);
+        return shouldConnect(world, pos, self, props, quadSprite, otherPos, face,
+            null, false);
+    }
+
+    /**
+     * 单方向连接检测。{@code other} 已由调用方读取时传 {@code hasOther=true}，
+     * 避免同一探针内重复 {@code world.getBlockState(otherPos)}（主语义与 connectTiles
+     * 共用同一份邻居 state，语义完全一致）。
+     */
+    private static boolean shouldConnect(IBlockAccess world, BlockPos pos, IBlockState self,
+                                         CtmProperties props, TextureAtlasSprite quadSprite,
+                                         BlockPos otherPos, EnumFacing face,
+                                         IBlockState other, boolean hasOther) {
+        IBlockState resolved = hasOther ? normalize(other) : otherState(world, otherPos);
+        boolean connected = hasOther
+            ? primaryConnect(world, self, props, quadSprite, otherPos, face, resolved, true)
+            : primaryConnect(world, self, props, quadSprite, otherPos, face);
         if (connected) return true;
 
         // connectTiles 附加条件：与使用了指定纹理的方块也连接（如 plank ↔ slab）
         List<String> connectTiles = props.getConnectTiles();
         if (!connectTiles.isEmpty()) {
-            IBlockState other = otherState(world, otherPos);
-            if (other == null) return false;
-            String name = spriteNameOf(other);
+            if (resolved == null) return false;
+            String name = spriteNameOf(resolved);
             if (name != null && connectTiles.contains(name)) return true;
         }
         return false;
@@ -181,6 +233,11 @@ public final class ConnectionHandler {
     private static IBlockState otherState(IBlockAccess world, BlockPos otherPos) {
         if (world == null || otherPos == null) return null;
         IBlockState other = world.getBlockState(otherPos);
+        return other == null || other.getBlock() == null ? null : other;
+    }
+
+    /** 与 {@link #otherState} 相同的空值/空气过滤，用于调用方已读取的邻居 state。 */
+    private static IBlockState normalize(IBlockState other) {
         return other == null || other.getBlock() == null ? null : other;
     }
 
@@ -194,25 +251,32 @@ public final class ConnectionHandler {
     private static boolean primaryConnect(IBlockAccess world, IBlockState self,
                                           CtmProperties props, TextureAtlasSprite quadSprite,
                                           BlockPos otherPos, EnumFacing face) {
+        return primaryConnect(world, self, props, quadSprite, otherPos, face, null, false);
+    }
+
+    private static boolean primaryConnect(IBlockAccess world, IBlockState self,
+                                          CtmProperties props, TextureAtlasSprite quadSprite,
+                                          BlockPos otherPos, EnumFacing face,
+                                          IBlockState other, boolean hasOther) {
         if (otherPos == null || self == null || props == null || world == null) return false;
-        IBlockState other = otherState(world, otherPos);
-        if (other == null) return false;
+        IBlockState resolved = hasOther ? normalize(other) : otherState(world, otherPos);
+        if (resolved == null) return false;
 
         String connect = props.getConnect(); // 含 OptiFine 默认（tile-based→tile, block-based→block）
         if ("material".equals(connect)) {
-            return self.getMaterial() == other.getMaterial();
+            return self.getMaterial() == resolved.getMaterial();
         } else if ("state".equals(connect)) {
-            return self.equals(other);
+            return self.equals(resolved);
         } else if ("tile".equals(connect)) {
             // OptiFine connect=tile：邻居在当前面的纹理与当前 quad 纹理相同才连接。
             // 必须按真实模型/真实种子取邻居该面纹理，且 general quads 只接受朝向一致的面；
             // 不能只按 state 缓存（动态模型纹理依赖世界坐标与种子）。
             return quadSprite != null && face != null
                 && quadSprite.getIconName().equals(
-                    tileOfFace(other, world, otherPos, face, quadSprite.getIconName()));
+                    tileOfFace(resolved, world, otherPos, face, quadSprite.getIconName()));
         }
         // block：同方块 ID
-        return self.getBlock() == other.getBlock();
+        return self.getBlock() == resolved.getBlock();
     }
 
     /**
@@ -227,6 +291,15 @@ public final class ConnectionHandler {
         return shouldConnect(world, pos, self, props, quadSprite, otherPos, face);
     }
 
+    /** 连接判定：邻居状态由调用方预读，避免同一探针重复读世界状态。 */
+    public static boolean connectsTo(IBlockAccess world, BlockPos pos, IBlockState self,
+                                     IBlockState other, CtmProperties props,
+                                     TextureAtlasSprite quadSprite, EnumFacing face,
+                                     BlockPos otherPos) {
+        return shouldConnect(world, pos, self, props, quadSprite, otherPos, face,
+            other, true);
+    }
+
     /**
      * 只按 connect 主语义判定（不含 connectTiles 放行），供 connect=tile 的几何剔除使用。
      */
@@ -234,6 +307,14 @@ public final class ConnectionHandler {
                                             CtmProperties props, TextureAtlasSprite quadSprite,
                                             EnumFacing face, BlockPos otherPos) {
         return primaryConnect(world, self, props, quadSprite, otherPos, face);
+    }
+
+    /** 主连接判定：邻居状态由调用方预读，避免重复读取。 */
+    public static boolean connectsToPrimary(IBlockAccess world, BlockPos pos, IBlockState self,
+                                            IBlockState other, CtmProperties props,
+                                            TextureAtlasSprite quadSprite, EnumFacing face,
+                                            BlockPos otherPos) {
+        return primaryConnect(world, self, props, quadSprite, otherPos, face, other, true);
     }
 
     /**

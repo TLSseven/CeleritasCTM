@@ -31,6 +31,7 @@ import javax.annotation.Nullable;
 import javax.vecmath.Matrix4f;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 
 public class CtmBakedModel implements IBakedModel {
@@ -130,15 +131,14 @@ public class CtmBakedModel implements IBakedModel {
         if (ctx.packedPos != Long.MIN_VALUE && !ctx.isPosUnchanged()) {
             return parent.getQuads(state, side, rand);
         }
-        if (state != null && state.getBlock() != null) {
-            try {
-                IBlockState worldState = ctx.world.getBlockState(ctx.pos);
-                if (worldState == null || worldState.getBlock() != state.getBlock()) {
-                    return parent.getQuads(state, side, rand);
-                }
-            } catch (Exception e) {
-                return parent.getQuads(state, side, rand);
-            }
+        IBlockState blockState;
+        try {
+            blockState = ctx.world.getBlockState(ctx.pos);
+        } catch (Exception e) {
+            return parent.getQuads(state, side, rand);
+        }
+        if (blockState == null || blockState.getBlock() != state.getBlock()) {
+            return parent.getQuads(state, side, rand);
         }
 
         List<BakedQuad> original = parent.getQuads(state, side, rand);
@@ -148,7 +148,7 @@ public class CtmBakedModel implements IBakedModel {
         boolean changed = false;
         List<BakedQuad> result = new ArrayList<>(original.size());
         for (BakedQuad quad : original) {
-            List<BakedQuad> processed = processQuadList(quad, ctx, side);
+            List<BakedQuad> processed = processQuadList(quad, ctx, side, blockState);
             if (processed.size() != 1 || processed.get(0) != quad) {
                 changed = true;
             }
@@ -157,15 +157,11 @@ public class CtmBakedModel implements IBakedModel {
         return changed ? result : original;
     }
 
-    private List<BakedQuad> processQuadList(BakedQuad quad, RenderContext ctx, EnumFacing side) {
+    private List<BakedQuad> processQuadList(BakedQuad quad, RenderContext ctx, EnumFacing side,
+                                            IBlockState blockState) {
+        if (blockState == null) return Collections.singletonList(quad);
         TextureAtlasSprite sprite = quad.getSprite();
-        if (sprite == null) return java.util.Collections.singletonList(quad);
-
-        // 传入方块状态：matchBlocks / metadata 需要它
-        IBlockState blockState = null;
-        try {
-            blockState = ctx.world.getBlockState(ctx.pos);
-        } catch (Exception ignored) {}
+        if (sprite == null) return Collections.singletonList(quad);
 
         // 面感知：用 quad 的实际朝向匹配 faces 规则。
         EnumFacing quadFace = quad.getFace();
@@ -190,7 +186,7 @@ public class CtmBakedModel implements IBakedModel {
         // ===== 更好的雪地（可配置）=====
         // 雪层下方的方块侧面显示雪纹理（草方块积雪侧面、普通方块侧面覆盖雪）
         if (CeleritasCTM.config().betterSnow && quadFace != null && quadFace.getAxis().isHorizontal()
-                && blockState != null && isSnowCovered(ctx)) {
+                && blockState != null && isSnowCovered(ctx, blockState)) {
             TextureAtlasSprite snow = Minecraft.getMinecraft().getTextureMapBlocks()
                 .getAtlasSprite("minecraft:blocks/snow");
             if (snow != null && "minecraft:blocks/snow".equals(snow.getIconName())) {
@@ -210,7 +206,8 @@ public class CtmBakedModel implements IBakedModel {
         // 资源包自带 glass 规则会先在 findMatch 命中，因此不会被此回退覆盖。
         if (props == null && CeleritasCTM.config().connectedGlass
                 && builtinGlass != null && isStainedGlass(blockState) && quadFace != null) {
-            int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, quadFace, builtinGlass, sprite);
+            int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, blockState,
+                quadFace, builtinGlass, sprite);
             String tile = builtinGlass.tileAt(CTM_INDEX_MAP[mask & 255]);
             if (tile != null) {
                 TextureAtlasSprite ts = CTMSpriteRegistry.getTileSprite(builtinGlass, tile);
@@ -237,7 +234,7 @@ public class CtmBakedModel implements IBakedModel {
             if (isConnectingMethod(props.getMethod())
                     && quadFace != null && blockState != null && !blockState.isOpaqueCube()
                     && props.appliesTo(quadFace)
-                    && isFullyCoveredInternalFace(quad, quadFace, props, ctx)) {
+                    && isFullyCoveredInternalFace(quad, quadFace, props, ctx, blockState)) {
                 return java.util.Collections.emptyList();
             }
             BakedQuad baseQuad = applyRule(quad, sprite, props, ctx, quadFace, blockState, 0);
@@ -286,7 +283,8 @@ public class CtmBakedModel implements IBakedModel {
      * <p>成本顺序：最廉价的共面/矩形校验最先执行；偏移/连接谓词其次；最后才查询邻居模型。
      */
     private static boolean isFullyCoveredInternalFace(BakedQuad quad, EnumFacing face,
-                                                      CtmProperties props, RenderContext ctx) {
+                                                      CtmProperties props, RenderContext ctx,
+                                                      IBlockState selfRaw) {
         if (quad == null || face == null || props == null || ctx == null) return false;
         if (ctx.pos == null || ctx.world == null) return false;
 
@@ -300,23 +298,32 @@ public class CtmBakedModel implements IBakedModel {
         float eps = QuadCoverage.GEOMETRY_EPSILON;
 
         // ---- 目标 quad：必须是共面的轴对齐矩形 ----
-        float[] min = new float[3];
-        float[] max = new float[3];
-        if (!quadBounds(quad, min, max)) return false;
-        if (Math.abs(max[axis] - min[axis]) > eps) return false;
-        float plane = min[axis];
+        VertexLayout layout = VertexLayout.of(quad);
+        if (layout == null) return false;
+        float[] corners = new float[QuadCoverage.CORNERS_LENGTH];
+        if (!QuadCoverage.readCorners(quad.getVertexData(), layout.stride,
+            layout.positionOffset, corners)) return false;
+
+        float minAxis = corners[axis];
+        float maxAxis = minAxis;
+        for (int i = 1; i < 4; i++) {
+            float value = corners[i * 3 + axis];
+            if (value < minAxis) minAxis = value;
+            if (value > maxAxis) maxAxis = value;
+        }
+        if (Math.abs(maxAxis - minAxis) > eps) return false;
+        float plane = minAxis;
         if (plane < -eps || plane > 1.0f + eps) return false;
 
-        QuadCoverage.Rect target = quadRect(quad, axis, plane, eps);
+        QuadCoverage.Rect target = QuadCoverage.rect(corners, axis, plane, eps);
         if (target == null) return false;
+
 
         // ---- 邻居 / 自身状态 ----
         BlockPos npos = ctx.pos.offset(face);
         IBlockState neighborRaw;
-        IBlockState selfRaw;
         try {
             neighborRaw = ctx.world.getBlockState(npos);
-            selfRaw = ctx.world.getBlockState(ctx.pos);
         } catch (Exception e) {
             return false;
         }
@@ -362,11 +369,13 @@ public class CtmBakedModel implements IBakedModel {
             InternalFaceCulling.connectKind(props.getConnect());
         boolean connects;
         try {
-            connects = kind == InternalFaceCulling.ConnectKind.TILE
-                ? ConnectionHandler.connectsToPrimary(ctx.world, ctx.pos, selfRaw, props,
-                    quad.getSprite(), face, npos)
-                : ConnectionHandler.connectsTo(ctx.world, ctx.pos, selfRaw, props,
-                    quad.getSprite(), face, npos);
+            if (kind == InternalFaceCulling.ConnectKind.TILE) {
+                connects = ConnectionHandler.connectsToPrimary(ctx.world, ctx.pos, selfRaw, neighborRaw,
+                    props, quad.getSprite(), face, npos);
+            } else {
+                connects = ConnectionHandler.connectsTo(ctx.world, ctx.pos, selfRaw, neighborRaw,
+                    props, quad.getSprite(), face, npos);
+            }
         } catch (Throwable t) {
             return false;
         }
@@ -380,7 +389,7 @@ public class CtmBakedModel implements IBakedModel {
         int requiredNormalSign = positive ? -1 : 1;
         List<QuadCoverage.Rect> neighborRects = neighborFaceRects(
             neighborActual, neighborExtended, npos, face.getOpposite(),
-            plane - InternalFaceCulling.planeShift(positive),
+            plane - InternalFaceCulling.planeShift(positive), target,
             axis, requiredNormalSign, tileFilter, eps);
         if (neighborRects == null || neighborRects.isEmpty()) return false;
 
@@ -421,21 +430,6 @@ public class CtmBakedModel implements IBakedModel {
         return !Double.isNaN(v) && !Double.isInfinite(v);
     }
 
-    /** 读取 quad 三轴范围（方块单位，不做单位推断）；数据不合法返回 false。 */
-    private static boolean quadBounds(BakedQuad quad, float[] min, float[] max) {
-        VertexLayout layout = VertexLayout.of(quad);
-        return layout != null && QuadCoverage.bounds(
-            quad.getVertexData(), layout.stride, layout.positionOffset, min, max);
-    }
-
-    /** 提取 quad 在给定平面上的轴对齐矩形；不是合格矩形返回 null。 */
-    private static QuadCoverage.Rect quadRect(BakedQuad quad, int axis, float plane, float eps) {
-        VertexLayout layout = VertexLayout.of(quad);
-        if (layout == null) return null;
-        return QuadCoverage.rect(quad.getVertexData(), layout.stride, layout.positionOffset,
-            axis, plane, eps);
-    }
-
     /**
      * 查询邻居模型在指定面上的实际 quad，提取与给定平面共面的轴对齐矩形。
      *
@@ -458,6 +452,7 @@ public class CtmBakedModel implements IBakedModel {
                                                              IBlockState neighborExtended,
                                                              BlockPos npos,
                                                              EnumFacing neighborFace, float localPlane,
+                                                             QuadCoverage.Rect target,
                                                              int axis, int requiredNormalSign,
                                                              String tileFilter, float eps) {
         RenderContext savedCtx = CURRENT_CONTEXT.get();
@@ -472,7 +467,7 @@ public class CtmBakedModel implements IBakedModel {
             if (model == null) return null;
             if (model.isBuiltInRenderer()) return null;
             return collectNeighborRects(model, neighborExtended, npos, neighborFace,
-                localPlane, axis, requiredNormalSign, tileFilter, eps);
+                localPlane, target, axis, requiredNormalSign, tileFilter, eps);
         } catch (Throwable t) {
             return null;
         } finally {
@@ -496,12 +491,25 @@ public class CtmBakedModel implements IBakedModel {
                                                         float localPlane, int axis,
                                                         int requiredNormalSign,
                                                         String tileFilter, float eps) {
+        return collectNeighborRects(model, extended, npos, neighborFace, localPlane, null,
+            axis, requiredNormalSign, tileFilter, eps);
+    }
+
+    private static List<QuadCoverage.Rect> collectNeighborRects(IBakedModel model, IBlockState extended,
+                                                               BlockPos npos, EnumFacing neighborFace,
+                                                               float localPlane, QuadCoverage.Rect target,
+                                                               int axis, int requiredNormalSign,
+                                                               String tileFilter, float eps) {
         long rand = MathHelper.getPositionRandom(npos);
         List<QuadCoverage.Rect> rects = new ArrayList<>(4);
+        float[] corners = new float[QuadCoverage.CORNERS_LENGTH];
         collectRects(model, extended, neighborFace, rand, axis, localPlane,
-            requiredNormalSign, tileFilter, eps, rects);
+            requiredNormalSign, tileFilter, eps, corners, rects);
+        if (target != null && InternalFaceCulling.shouldCull(target, rects, true, eps)) {
+            return rects;
+        }
         collectRects(model, extended, null, rand, axis, localPlane,
-            requiredNormalSign, tileFilter, eps, rects);
+            requiredNormalSign, tileFilter, eps, corners, rects);
         return rects;
     }
 
@@ -519,6 +527,15 @@ public class CtmBakedModel implements IBakedModel {
                              int axis, float localPlane, int requiredNormalSign,
                              String tileFilter, float eps,
                              List<QuadCoverage.Rect> out) {
+        float[] corners = new float[QuadCoverage.CORNERS_LENGTH];
+        collectRects(model, state, side, rand, axis, localPlane, requiredNormalSign,
+            tileFilter, eps, corners, out);
+    }
+
+    private static void collectRects(IBakedModel model, IBlockState state, EnumFacing side, long rand,
+                                     int axis, float localPlane, int requiredNormalSign,
+                                     String tileFilter, float eps, float[] corners,
+                                     List<QuadCoverage.Rect> out) {
         List<BakedQuad> quads = model.getQuads(state, side, rand);
         if (quads == null || quads.isEmpty()) return;
         for (BakedQuad q : quads) {
@@ -529,15 +546,36 @@ public class CtmBakedModel implements IBakedModel {
                 TextureAtlasSprite s = q.getSprite();
                 if (s == null || !tileFilter.equals(s.getIconName())) continue;
             }
-            VertexLayout layout = VertexLayout.of(q);
-            if (layout == null) continue;
-            if (QuadCoverage.axisNormalSign(q.getVertexData(), layout.stride,
-                layout.positionOffset, axis) != requiredNormalSign) {
-                continue;
-            }
-            QuadCoverage.Rect r = QuadCoverage.rect(q.getVertexData(), layout.stride,
-                layout.positionOffset, axis, localPlane, eps);
+            long packedLayout = packedVertexLayout(q);
+            if (packedLayout == 0L) continue;
+            int stride = (int) (packedLayout >>> 32);
+            int positionOffset = (int) packedLayout;
+            if (!QuadCoverage.readCorners(q.getVertexData(), stride, positionOffset, corners)) continue;
+            if (QuadCoverage.axisNormalSign(corners, axis) != requiredNormalSign) continue;
+            QuadCoverage.Rect r = QuadCoverage.rect(corners, axis, localPlane, eps);
             if (r != null) out.add(r);
+        }
+    }
+
+    /** Vertex format layout packed into a long; zero means invalid. */
+    private static long packedVertexLayout(BakedQuad quad) {
+        if (quad == null) return 0L;
+        int[] data = quad.getVertexData();
+        VertexFormat format = quad.getFormat();
+        if (data == null || format == null) return 0L;
+        try {
+            if (format.getElementCount() == 0) return 0L;
+            VertexFormatElement pos = format.getElement(0);
+            if (pos.getUsage() != VertexFormatElement.EnumUsage.POSITION
+                    || pos.getType() != VertexFormatElement.EnumType.FLOAT
+                    || pos.getElementCount() != 3 || pos.getIndex() != 0) return 0L;
+            int stride = format.getIntegerSize();
+            int offset = format.getOffset(0) / 4;
+            if (stride < 3 || offset < 0 || offset + 2 >= stride
+                    || (long) stride * 4 > data.length) return 0L;
+            return ((long) stride << 32) | (offset & 0xffffffffL);
+        } catch (RuntimeException e) {
+            return 0L;
         }
     }
 
@@ -559,15 +597,13 @@ public class CtmBakedModel implements IBakedModel {
             try {
                 if (format.getElementCount() == 0) return null;
                 VertexFormatElement pos = format.getElement(0);
-                if (pos.getUsage() != VertexFormatElement.EnumUsage.POSITION) return null;
-                // 位置必须是 3 个 float（不能用 short/其他类型，否则 intBitsToFloat 会读错）
-                if (pos.getType() != VertexFormatElement.EnumType.FLOAT) return null;
-                if (pos.getElementCount() != 3) return null;
-                if (pos.getIndex() != 0) return null;
+                if (pos.getUsage() != VertexFormatElement.EnumUsage.POSITION
+                        || pos.getType() != VertexFormatElement.EnumType.FLOAT
+                        || pos.getElementCount() != 3 || pos.getIndex() != 0) return null;
                 int stride = format.getIntegerSize();
                 int offset = format.getOffset(0) / 4;
-                if (stride < 3 || offset < 0 || offset + 2 >= stride) return null;
-                if ((long) stride * 4 > data.length) return null;
+                if (stride < 3 || offset < 0 || offset + 2 >= stride
+                        || (long) stride * 4 > data.length) return null;
                 return new VertexLayout(stride, offset);
             } catch (RuntimeException e) {
                 return null;
@@ -631,8 +667,8 @@ public class CtmBakedModel implements IBakedModel {
     /**
      * 更好的雪地判定：当前方块上方是雪层（且当前方块本身不是雪/冰，避免自覆盖）。
      */
-    private static boolean isSnowCovered(RenderContext ctx) {
-        IBlockState selfState = ctx.world.getBlockState(ctx.pos);
+    private static boolean isSnowCovered(RenderContext ctx, IBlockState selfState) {
+        if (selfState == null) return false;
         Block self = selfState.getBlock();
         if (self == Blocks.SNOW_LAYER || self == Blocks.SNOW || self == Blocks.ICE
                 || self == Blocks.PACKED_ICE || self == Blocks.FROSTED_ICE) {
@@ -719,13 +755,14 @@ public class CtmBakedModel implements IBakedModel {
             case "ctm":
             case "ctm_compact": {
                 if (quadFace == null) return quad;
-                int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                int mask = ConnectionHandler.getMask(ctx.world, ctx.pos, blockState, quadFace, props, sprite);
                 tile = props.tileAt(CTM_INDEX_MAP[mask & 255]);
                 break;
             }
             case "horizontal": {
                 if (quadFace == null) return quad;
-                int mask = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                int mask = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, blockState,
+                    quadFace, props, sprite);
                 tile = props.tileAt(HORIZONTAL_INDEX_MAP[mask]);
                 break;
             }
@@ -739,10 +776,12 @@ public class CtmBakedModel implements IBakedModel {
                 //   表现为中间夹 1 格高的断裂图像。）
                 if (quadFace == null) {
                     // 真正的无朝向 quad（如部分 mod 自定义 quad）：用世界空间上下方向判断连接
-                    int mask = ConnectionHandler.getVerticalMaskWorld(ctx.world, ctx.pos, props, sprite);
+                    int mask = ConnectionHandler.getVerticalMaskWorld(ctx.world, ctx.pos,
+                        blockState, props, sprite);
                     tile = props.tileAt(VERTICAL_INDEX_MAP[mask]);
                 } else {
-                    int mask = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                    int mask = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, blockState,
+                        quadFace, props, sprite);
                     tile = props.tileAt(VERTICAL_INDEX_MAP[mask]);
                 }
                 break;
@@ -750,11 +789,13 @@ public class CtmBakedModel implements IBakedModel {
             case "horizontal+vertical":
             case "h+v": {
                 if (quadFace == null) return quad;
-                int hm = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                int hm = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, blockState,
+                    quadFace, props, sprite);
                 if (hm != 0) {
                     tile = props.tileAt(HORIZONTAL_INDEX_MAP[hm]);
                 } else {
-                    int vm = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                    int vm = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, blockState,
+                        quadFace, props, sprite);
                     tile = props.tileAt(VERTICAL_INDEX_MAP[vm]);
                 }
                 break;
@@ -762,18 +803,21 @@ public class CtmBakedModel implements IBakedModel {
             case "vertical+horizontal":
             case "v+h": {
                 if (quadFace == null) return quad;
-                int vm = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                int vm = ConnectionHandler.getVerticalMask(ctx.world, ctx.pos, blockState,
+                    quadFace, props, sprite);
                 if (vm != 0) {
                     tile = props.tileAt(VERTICAL_INDEX_MAP[vm]);
                 } else {
-                    int hm = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, quadFace, props, sprite);
+                    int hm = ConnectionHandler.getHorizontalMask(ctx.world, ctx.pos, blockState,
+                    quadFace, props, sprite);
                     tile = props.tileAt(HORIZONTAL_INDEX_MAP[hm]);
                 }
                 break;
             }
             case "top": {
                 if (quadFace == null) return quad;
-                if (ConnectionHandler.isConnected(ctx.world, ctx.pos, props, sprite, EnumFacing.UP)) {
+                if (ConnectionHandler.isConnected(ctx.world, ctx.pos, blockState,
+                    props, sprite, EnumFacing.UP)) {
                     tile = props.tileAt(0);
                 } else {
                     return quad;

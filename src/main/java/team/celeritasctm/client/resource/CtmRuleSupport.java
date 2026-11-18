@@ -116,6 +116,12 @@ public final class CtmRuleSupport {
         public Map<String, List<String>> getPropertyValues() { return properties; }
 
         /**
+         * 是否带状态属性谓词。热路径用它在取状态属性表之前先短路：
+         * 没有谓词的匹配条目完全不需要构建属性 HashMap。
+         */
+        public boolean hasProperties() { return !properties.isEmpty(); }
+
+        /**
          * 谓词是否被给定状态属性满足。空谓词恒真。
          *
          * <p>多值谓词（{@code prop=a,b}）语义为 OR：实际值匹配任一允许值即可。

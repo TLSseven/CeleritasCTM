@@ -2,7 +2,6 @@ package team.celeritasctm.client.model;
 
 import team.celeritasctm.client.model.QuadCoverage.Rect;
 
-import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -137,13 +136,9 @@ public final class InternalFaceCulling {
 
     /** 邻居实际 quad 的平面内并集是否完整覆盖目标（已通过连接谓词后调用）。 */
     private static boolean covered(Rect target, List<Rect> neighborRects, float eps) {
-        List<Rect> usable = new ArrayList<>(neighborRects.size());
-        for (Rect r : neighborRects) {
-            if (r == null) continue;
-            if (!r.isNonDegenerate(eps)) continue;
-            usable.add(r);
-        }
-        return QuadCoverage.unionCovers(usable, target, eps);
+        // QuadCoverage.unionCovers 自身会跳 null/退化项，且不要求预过滤副本：
+        // 直接传入原列表，避免每个面额外复制一次矩形列表。
+        return QuadCoverage.unionCovers(neighborRects, target, eps);
     }
 
     /**

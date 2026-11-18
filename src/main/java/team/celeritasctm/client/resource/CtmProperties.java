@@ -23,6 +23,8 @@ public class CtmProperties implements Comparable<CtmProperties> {
     private final List<String> matchBlocks = new ArrayList<>();
     // matchBlocks 的规范化结果（数字 ID 解析为注册名后也放这里；可与 matchBlocks 数量不一致）
     private final List<CtmRuleSupport.BlockMatch> blockMatches = new ArrayList<>();
+    // blockMatches 中是否有带状态属性谓词的条目（热路径据此决定是否需要状态属性表）
+    private boolean blockPropertiesPresent = false;
     // 数字 ID 条目（注册表不可用时保留，待延迟解析；不当作空气方块）
     private final List<Integer> deferredNumericIds = new ArrayList<>();
     private final List<String> connectTiles = new ArrayList<>();
@@ -90,6 +92,14 @@ public class CtmProperties implements Comparable<CtmProperties> {
     }
     /** 是否要求世界高度上下文 */
     public boolean hasHeightRestriction() { return heightRanges != null && !heightRanges.isEmpty(); }
+
+    /**
+     * 该规则是否需要世界环境上下文（height / biome）。
+     * 热路径据此惰性创建环境对象：不限制环境的规则（绝大多数）完全不分配。
+     */
+    public boolean needsEnvironment() {
+        return hasHeightRestriction() || hasBiomeRestriction();
+    }
 
     /** biome 限制（规范化键集合，null 表示不限制） */
     public Set<String> getBiomes() { return biomes; }
@@ -161,7 +171,7 @@ public class CtmProperties implements Comparable<CtmProperties> {
         if (token.isEmpty()) return;
         matchBlocks.add(token);
         CtmRuleSupport.BlockMatch parsed = CtmRuleSupport.parseMatchToken(token);
-        if (parsed != null) blockMatches.add(parsed);
+        if (parsed != null) addBlockMatch(parsed);
     }
 
     /**
@@ -179,6 +189,15 @@ public class CtmProperties implements Comparable<CtmProperties> {
     public void addBlockMatch(CtmRuleSupport.BlockMatch match) {
         if (match == null) return;
         blockMatches.add(match);
+        if (match.hasProperties()) blockPropertiesPresent = true;
+    }
+
+    /**
+     * 该规则是否有带状态属性谓词的 matchBlocks 条目。
+     * 为 false 时匹配完全不需要状态属性表（热路径不再构建 HashMap）。
+     */
+    public boolean hasBlockPropertyPredicates() {
+        return blockPropertiesPresent;
     }
 
     /** 是否没有任何可用的方块匹配条目（含尚未解析的数字 ID） */
@@ -247,6 +266,22 @@ public class CtmProperties implements Comparable<CtmProperties> {
      * 不再有“索引拼 {@code minecraft:} 前缀、匹配端比短名”的两条路径。
      */
     public boolean matchesBlock(net.minecraft.block.state.IBlockState state) {
+        return matchesBlock(state, null, null);
+    }
+
+    public boolean matchesBlock(net.minecraft.block.state.IBlockState state, String canonicalKey) {
+        return matchesBlock(state, canonicalKey, null);
+    }
+
+    /**
+     * 热路径重载：规范化键与状态属性表都可以由调用方在<b>一次匹配请求内</b>算好并复用。
+     *
+     * <p>{@code canonicalKey} 为空时本方法自行计算；{@code resolvedProperties}
+     * 非空时直接使用（同一方块状态在一次 {@code findMatch} 中只需构建一次），
+     * 为空时才在真正遇到带谓词的候选条目时惰性构建。
+     */
+    public boolean matchesBlock(net.minecraft.block.state.IBlockState state, String canonicalKey,
+                                Map<String, String> resolvedProperties) {
         if (!hasBlockConstraint()) return true;
         if (state == null) return false;
         // 延迟数字 ID：直接比较状态方块的数字 ID，不经过“查不到就映射为空气”的路径。
@@ -261,15 +296,17 @@ public class CtmProperties implements Comparable<CtmProperties> {
             }
         }
         if (blockMatches.isEmpty()) return false;
-        String key = canonicalKeyOf(state);
+        String key = canonicalKey != null ? canonicalKey : canonicalKeyOf(state);
         if (key == null) return false;
-        Map<String, String> props = statePropertyMap(state);
+        Map<String, String> props = resolvedProperties; // 仅在遇到带谓词的候选时构建
         for (CtmRuleSupport.BlockMatch m : blockMatches) {
             if (m.isNumeric()) continue; // 数字 ID 在加载期已解析为键，未解析成功的条目不参与
             if (!m.matchesKey(key)) continue;
+            if (!m.hasProperties()) return true; // 无谓词：键命中即可，不读取状态属性
+            if (props == null) props = statePropertyMap(state);
             if (m.matchesProperties(props)) return true;
             // 属性名在方块状态里根本不存在 → 大概率是规则写错了，warn 一次便于定位
-            for (String propName : m.getProperties().keySet()) {
+            for (String propName : m.getPropertyValues().keySet()) {
                 if (!props.containsKey(propName)) {
                     CtmRuleSupport.warnUnknownProperty(key, propName);
                 }
@@ -336,12 +373,24 @@ public class CtmProperties implements Comparable<CtmProperties> {
     public boolean matchesTile(String textureName) {
         if (matchTilesClean.isEmpty()) return true;
         if (textureName == null) return false;
-        String clean = cleanTextureName(textureName);
-        String ns = namespaceOf(textureName);
+        return matchesTileClean(cleanTextureName(textureName), namespaceOf(textureName));
+    }
+
+    /**
+     * 使用<b>已清理</b>的纹理名进行匹配。{@code findMatch} 每请求只清理一次，
+     * 索引查找与逐条候选判定共用同一个字符串，避免每个候选/每条规则重复做
+     * {@code substring}（去命名空间、{@code ./}、{@code .png}、{@code blocks/}）。
+     *
+     * @param cleanName 已清理纹理名；null 表示调用方没有纹理上下文
+     * @param namespace 纹理命名空间（{@link #namespaceOf} 的结果，显式命名空间条目用）
+     */
+    public boolean matchesTileClean(String cleanName, String namespace) {
+        if (matchTilesClean.isEmpty()) return true;
+        if (cleanName == null) return false;
         for (int i = 0; i < matchTilesClean.size(); i++) {
-            if (!matchTilesClean.get(i).equals(clean)) continue;
+            if (!matchTilesClean.get(i).equals(cleanName)) continue;
             String explicitNs = i < matchTilesExplicitNs.size() ? matchTilesExplicitNs.get(i) : null;
-            if (explicitNs == null || ns == null || explicitNs.equalsIgnoreCase(ns)) return true;
+            if (explicitNs == null || namespace == null || explicitNs.equalsIgnoreCase(namespace)) return true;
         }
         return false;
     }

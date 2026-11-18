@@ -1,9 +1,14 @@
 package team.celeritasctm.client.resource;
 
+import net.minecraft.block.Block;
+import net.minecraft.block.material.Material;
+import net.minecraft.block.state.IBlockState;
 import net.minecraft.util.ResourceLocation;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -52,6 +57,10 @@ public final class CtmGenericRuleTest {
         testNumericIdNeverAir();
         testSnapshotAtomicity();
         testFindMatchPriority();
+        testHotPathNoPropertyMapForPlainBlockRule();
+        testHotPathPrecomputedCanonicalKey();
+        testMatchesTileCleanMatchesMatchesTile();
+        testFindMatchStillAppliesEnvironmentRules();
 
         System.out.println();
         System.out.println("passed=" + passed + " failed=" + failures.size());
@@ -424,6 +433,246 @@ public final class CtmGenericRuleTest {
         check("metadata restriction kept", restricted != null && restricted.getMetadata() != null);
         check("restricted metadata does not match null state",
             restricted != null && !restricted.matchesMetadata(null));
+    }
+
+    // ---------------- hot path ----------------
+
+    /**
+     * 无状态谓词的纯 {@code matchBlocks=ns:name} 规则不得为每个方块状态构建
+     * 属性 HashMap：{@link CtmProperties#matchesBlock} 与 {@code findMatch} 都应在
+     * 键命中后直接返回。用状态代理统计 {@code getProperties()} 调用次数验证。
+     */
+    private static void testHotPathNoPropertyMapForPlainBlockRule() {
+        CtmProperties plain = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone\n",
+            "mcpatcher/ctm/plain.properties");
+        check("plain block rule parsed", plain != null && plain.hasBlockMatches());
+
+        int[] propertyReads = new int[1];
+        IBlockState state = stateProxy("examplemod:stone", Collections.<String, String>emptyMap(), propertyReads);
+
+        check("plain block rule matches state directly", plain.matchesBlock(state));
+        check("plain block rule reads no state properties", propertyReads[0] == 0);
+
+        CtmPropertiesLoader.RuleSnapshot snap = blockSnapshot(plain);
+        propertyReads[0] = 0;
+        check("findMatch hits plain block rule",
+            CtmPropertiesLoader.findMatchInSnapshot(snap, null, state, null, null, null) == plain);
+        check("findMatch does not build property map for plain rule", propertyReads[0] == 0);
+
+        // 带谓词的规则仍然要读属性表（否则会漏判）
+        CtmProperties pred = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone:age=7\n",
+            "mcpatcher/ctm/pred.properties");
+        int[] predReads = new int[1];
+        Map<String, String> props = new LinkedHashMap<>();
+        props.put("age", "7");
+        IBlockState predState = stateProxy("examplemod:stone", props, predReads);
+        check("predicate rule matches matching state", pred.matchesBlock(predState));
+        check("predicate rule reads properties when needed", predReads[0] > 0);
+        check("predicate rule rejects wrong value",
+            !pred.matchesBlock(stateProxy("examplemod:stone", singleton("age", "3"), new int[1])));
+        check("predicate rule does not match other block",
+            !pred.matchesBlock(stateProxy("examplemod:dirt", props, new int[1])));
+
+        // 请求内共享：多个带谓词的候选只构建一次状态属性表
+        CtmProperties nonMatch = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone:age=3\n",
+            "mcpatcher/ctm/pred_a.properties");
+        CtmProperties match = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone:age=7\n",
+            "mcpatcher/ctm/pred_b.properties");
+        int[] sharedReads = new int[1];
+        IBlockState sharedState = stateProxy("examplemod:stone", props, sharedReads);
+        Map<String, List<CtmProperties>> index = new LinkedHashMap<>();
+        index.put("examplemod:stone", new ArrayList<>(Arrays.asList(nonMatch, match)));
+        CtmPropertiesLoader.RuleSnapshot predicateSnap = new CtmPropertiesLoader.RuleSnapshot(
+            Arrays.asList(nonMatch, match), Collections.<String, List<CtmProperties>>emptyMap(),
+            index, null, Collections.<CtmProperties>emptyList());
+        check("findMatch resolves predicate rule",
+            CtmPropertiesLoader.findMatchInSnapshot(predicateSnap, null, sharedState, null, null, null) == match);
+        check("state property map built once per request", sharedReads[0] == 1);
+    }
+
+    /** 请求内传入的规范化键必须被直接使用（同一键不同字符串写法不应影响结果）。 */
+    private static void testHotPathPrecomputedCanonicalKey() {
+        CtmProperties plain = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone\n",
+            "mcpatcher/ctm/key.properties");
+        int[] reads = new int[1];
+        IBlockState state = stateProxy("examplemod:stone", Collections.<String, String>emptyMap(), reads);
+        check("precomputed key matches", plain.matchesBlock(state, "examplemod:stone"));
+        check("precomputed key rejects other", !plain.matchesBlock(state, "examplemod:dirt"));
+        check("precomputed key path reads no properties", reads[0] == 0);
+        check("null precomputed key falls back to state key",
+            plain.matchesBlock(state, null) && reads[0] == 0);
+
+        // 无方块约束的规则不受键影响
+        CtmProperties tileOnly = new CtmProperties(new ResourceLocation("example", "t.properties"), "ctm", 1);
+        tileOnly.addMatchTile("blocks/stone");
+        check("unconstrained rule accepts any key", tileOnly.matchesBlock(state, "examplemod:dirt"));
+    }
+
+    /** matchesTileClean 必须是 matchesTile 的等价快路径（索引/候选共用已清理名）。 */
+    private static void testMatchesTileCleanMatchesMatchesTile() {
+        CtmProperties p = new CtmProperties(new ResourceLocation("examplemod", "t.properties"), "ctm", 1);
+        p.addMatchTile("minecraft:blocks/stone");
+        p.addMatchTile("blocks/dirt");
+        String[] probes = {
+            "minecraft:blocks/stone", "examplemod:blocks/stone", "blocks/dirt",
+            "othermod:blocks/dirt", "minecraft:blocks/stone.png", null
+        };
+        for (String probe : probes) {
+            boolean expected = p.matchesTile(probe);
+            boolean actual = p.matchesTileClean(
+                CtmProperties.cleanTextureName(probe),
+                probe == null ? null : CtmProperties.namespaceOf(probe));
+            check("matchesTileClean parity for " + probe, expected == actual);
+        }
+        check("matchesTileClean namespace-aware reject",
+            !p.matchesTileClean("stone", "examplemod"));
+        check("matchesTileClean namespace-aware accept",
+            p.matchesTileClean("stone", "minecraft"));
+    }
+
+    /** 惰性 EnvContext：有限制规则仍然 fail-closed/正确判定，无限制规则不受影响。 */
+    private static void testFindMatchStillAppliesEnvironmentRules() {
+        CtmProperties limited = parse("method=ctm\ntiles=0-3\nheights=0-63\n"
+            + "matchBlocks=examplemod:stone\n", "mcpatcher/ctm/hotheight.properties");
+        check("height-limited block rule parsed", limited != null && limited.hasHeightRestriction());
+        check("height-limited rule needs environment", limited.needsEnvironment());
+
+        CtmProperties plain = parse("method=ctm\ntiles=0-3\nmatchBlocks=examplemod:stone\n",
+            "mcpatcher/ctm/hotplain.properties");
+        check("plain block rule needs no environment", plain != null && !plain.needsEnvironment());
+
+        IBlockState state = stateProxy("examplemod:stone", Collections.<String, String>emptyMap(), new int[1]);
+        net.minecraft.util.math.BlockPos inside = new net.minecraft.util.math.BlockPos(0, 10, 0);
+        net.minecraft.util.math.BlockPos outside = new net.minecraft.util.math.BlockPos(0, 200, 0);
+
+        check("height-limited rule matches inside range",
+            CtmPropertiesLoader.findMatchInSnapshot(blockSnapshot(limited), null, state, null, null, inside)
+                == limited);
+        check("height-limited rule fails closed outside range",
+            CtmPropertiesLoader.findMatchInSnapshot(blockSnapshot(limited), null, state, null, null, outside)
+                == null);
+        check("height-limited rule fails closed without position",
+            CtmPropertiesLoader.findMatchInSnapshot(blockSnapshot(limited), null, state, null, null, null)
+                == null);
+    }
+
+    private static Map<String, String> singleton(String k, String v) {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put(k, v);
+        return m;
+    }
+
+    private static CtmPropertiesLoader.RuleSnapshot blockSnapshot(CtmProperties rule) {
+        Map<String, List<CtmProperties>> blockIndex = new LinkedHashMap<>();
+        for (CtmRuleSupport.BlockMatch m : rule.getBlockMatches()) {
+            if (m.getKey() != null && !m.isNumeric()) {
+                blockIndex.computeIfAbsent(m.getKey(), k -> new ArrayList<>()).add(rule);
+            }
+        }
+        return new CtmPropertiesLoader.RuleSnapshot(
+            Collections.singletonList(rule),
+            Collections.<String, List<CtmProperties>>emptyMap(),
+            blockIndex, null, Collections.<CtmProperties>emptyList());
+    }
+
+    /** 计数 getProperties() 调用的 IBlockState 代理；方块注册名固定。 */
+    private static IBlockState stateProxy(final String registryName, final Map<String, String> properties,
+                                          final int[] propertyReads) {
+        final Block block = fakeBlock(registryName);
+        InvocationHandler h = (proxy, method, args) -> {
+            switch (method.getName()) {
+                case "getBlock": return block;
+                case "getProperties":
+                case "getPropertiesMap":
+                    propertyReads[0]++;
+                    return fakeProperties(properties);
+                case "toString": return "teststate@" + registryName;
+                case "hashCode": return System.identityHashCode(proxy);
+                case "equals": return proxy == args[0];
+                default: return null;
+            }
+        };
+        return (IBlockState) Proxy.newProxyInstance(
+            CtmGenericRuleTest.class.getClassLoader(), new Class<?>[] { IBlockState.class }, h);
+    }
+
+    /**
+     * 构造 IProperty 键的不可变属性表（与真实 {@code IBlockState#getProperties()}
+     * 的返回类型一致：{@code ImmutableMap}）。
+     */
+    private static com.google.common.collect.ImmutableMap<net.minecraft.block.properties.IProperty<?>, Comparable<?>>
+            fakeProperties(Map<String, String> properties) {
+        com.google.common.collect.ImmutableMap.Builder<net.minecraft.block.properties.IProperty<?>, Comparable<?>>
+            out = com.google.common.collect.ImmutableMap.builder();
+        for (Map.Entry<String, String> e : properties.entrySet()) {
+            final String name = e.getKey();
+            final String value = e.getValue();
+            net.minecraft.block.properties.IProperty<?> key =
+                (net.minecraft.block.properties.IProperty<?>) Proxy.newProxyInstance(
+                    CtmGenericRuleTest.class.getClassLoader(),
+                    new Class<?>[] { net.minecraft.block.properties.IProperty.class },
+                    (proxy, method, args) -> {
+                        switch (method.getName()) {
+                            case "getName": return name;
+                            case "toString": return name;
+                            case "hashCode": return name.hashCode();
+                            case "equals": return proxy == args[0];
+                            default: return null;
+                        }
+                    });
+            out.put(key, value);
+        }
+        return out.build();
+    }
+
+    /**
+     * 不触发 Block 构造器副作用（SoundType/SoundEvents 静态初始化）地创建 Block：
+     * 需要的是 getRegistryName 的虚分派，不需要构造器。
+     */
+    private static Block fakeBlock(String registryName) {
+        try {
+            Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field field = unsafeClass.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            Object unsafe = field.get(null);
+            java.lang.reflect.Method allocate = unsafeClass.getMethod("allocateInstance", Class.class);
+            NamedBlock block = (NamedBlock) allocate.invoke(unsafe, NamedBlock.class);
+            // getRegistryName()/setRegistryName() 在 Forge 的 IForgeRegistryEntry.Impl 中是 final，
+            // 且 setRegistryName 会走 GameData 前缀校验（脱离游戏进程不可用）。
+            // getRegistryName() 优先读 delegate.name()，因此这里注入一个只回答名字的代理。
+            final ResourceLocation name = new ResourceLocation(registryName);
+            Object delegate = Proxy.newProxyInstance(
+                CtmGenericRuleTest.class.getClassLoader(),
+                new Class<?>[] { net.minecraftforge.registries.IRegistryDelegate.class },
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "name": return name;
+                        case "get": return block;
+                        case "type": return Block.class;
+                        case "toString": return "delegate@" + name;
+                        case "hashCode": return System.identityHashCode(proxy);
+                        case "equals": return proxy == args[0];
+                        default: return null;
+                    }
+                });
+            java.lang.reflect.Field delegateField = Class.forName(
+                "net.minecraftforge.registries.IForgeRegistryEntry$Impl").getDeclaredField("delegate");
+            delegateField.setAccessible(true);
+            delegateField.set(block, delegate);
+            return block;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("cannot allocate fake block", e);
+        }
+    }
+
+    /**
+     * 只用于提供注册名的假方块。构造器永远不会被调用（实例经 Unsafe 分配），
+     * 但 Java 要求子类构造器显式调用父类构造器。
+     */
+    public static class NamedBlock extends Block {
+        public NamedBlock() {
+            super(Material.ROCK);
+        }
     }
 
     // ---------------- harness ----------------
