@@ -355,6 +355,17 @@ public class CtmBakedModel implements IBakedModel {
         float[] nMin = { (float) nb.minX, (float) nb.minY, (float) nb.minZ };
         float[] nMax = { (float) nb.maxX, (float) nb.maxY, (float) nb.maxZ };
 
+        // AABB may be the default full cube even when the rendered shape is partial (e.g. stairs).
+        // BlockFaceShape still allows full faces on transparent blocks such as glass.
+        boolean neighborFaceSolid;
+        try {
+            neighborFaceSolid = neighbor.getBlockFaceShape(ctx.world, npos, face.getOpposite())
+                == net.minecraft.block.state.BlockFaceShape.SOLID;
+        } catch (Throwable t) {
+            return false;
+        }
+        if (!neighborFaceSolid) return false;
+
         // ---- 连接谓词证据 ----
         boolean sameBlock = neighbor.getBlock() == self.getBlock();
         boolean sameState = sameBlock && neighbor.equals(self);

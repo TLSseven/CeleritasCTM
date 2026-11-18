@@ -3,8 +3,9 @@ package team.celeritasctm.client.model;
 /**
  * 内部面剔除的纯几何/连接谓词（不依赖 Minecraft 类型，可直接单测）。
  *
- * <p>剔除一个面必须同时具备三项证据（缺一不可）：
+ * <p>剔除一个面必须同时具备四项证据（缺一不可）：
  * <ol>
+ *   <li><b>邻居面完整</b>：朝向当前方块的邻居面必须是完整实面；</li>
  *   <li><b>同轴共面贴合</b>：quad 在面法线轴上是一个平面，且该平面与邻居 bbox 的
  *       内侧边精确贴合（相差不超过容差）；</li>
  *   <li><b>二维完整覆盖</b>：邻居 bbox 在 quad 平面内的另两轴投影必须完整覆盖 quad
@@ -139,13 +140,32 @@ public final class InternalFaceCulling {
                                      ConnectKind kind, boolean sameBlock, boolean sameState,
                                      boolean sameMaterial, boolean tileMatch) {
         return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
-                kind, sameBlock, sameState, sameMaterial, tileMatch, DEFAULT_TOLERANCE);
+                kind, sameBlock, sameState, sameMaterial, tileMatch, true, DEFAULT_TOLERANCE);
     }
 
     public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
                                      float[] neighborMin, float[] neighborMax,
                                      ConnectKind kind, boolean sameBlock, boolean sameState,
                                      boolean sameMaterial, boolean tileMatch, float tolerance) {
+        return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
+                kind, sameBlock, sameState, sameMaterial, tileMatch, true, tolerance);
+    }
+
+    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
+                                     float[] neighborMin, float[] neighborMax,
+                                     ConnectKind kind, boolean sameBlock, boolean sameState,
+                                     boolean sameMaterial, boolean tileMatch,
+                                     boolean neighborFaceSolid) {
+        return shouldCull(quadMin, quadMax, axis, positive, neighborMin, neighborMax,
+                kind, sameBlock, sameState, sameMaterial, tileMatch,
+                neighborFaceSolid, DEFAULT_TOLERANCE);
+    }
+
+    public static boolean shouldCull(float[] quadMin, float[] quadMax, int axis, boolean positive,
+                                     float[] neighborMin, float[] neighborMax,
+                                     ConnectKind kind, boolean sameBlock, boolean sameState,
+                                     boolean sameMaterial, boolean tileMatch,
+                                     boolean neighborFaceSolid, float tolerance) {
         if (quadMin == null || quadMax == null || neighborMin == null || neighborMax == null) return false;
         if (quadMin.length < 3 || quadMax.length < 3 || neighborMin.length < 3 || neighborMax.length < 3) {
             return false;
@@ -153,10 +173,13 @@ public final class InternalFaceCulling {
         if (axis < 0 || axis > 2) return false;
         if (tolerance < 0.0f) tolerance = DEFAULT_TOLERANCE;
 
-        // 1) 连接谓词：不连接就不可能形成内部面
+        // 1) 邻居朝向当前方块的面必须完整；默认 AABB 不能证明楼梯等模型的实际遮挡形状
+        if (!neighborFaceSolid) return false;
+
+        // 2) 连接谓词：不连接就不可能形成内部面
         if (!connectAllows(kind, sameBlock, sameState, sameMaterial, tileMatch)) return false;
 
-        // 2) quad 在该轴上必须是平面
+        // 3) quad 在该轴上必须是平面
         float plane = quadMin[axis];
         if (Math.abs(quadMax[axis] - plane) > tolerance) return false;
 

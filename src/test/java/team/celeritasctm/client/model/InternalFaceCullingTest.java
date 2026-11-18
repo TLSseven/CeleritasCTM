@@ -16,6 +16,9 @@ public final class InternalFaceCullingTest {
     public static void main(String[] args) {
         connectKindIsParsed();
         fullBlockEastFaceIsCulled();
+        incompleteNeighborFaceIsKept();
+        completeTransparentNeighborFaceIsCulled();
+        completeStairFaceIsCulled();
         partialCoverageIsKept();
         wrongPlaneIsKept();
         nonPlanarQuadIsKept();
@@ -62,6 +65,39 @@ public final class InternalFaceCullingTest {
         check("满方块东面剔除", InternalFaceCulling.shouldCull(
             qMin, qMax, 0, true, nMin, nMax,
             InternalFaceCulling.ConnectKind.BLOCK, true, true, true, true));
+    }
+
+    /** 即使 bbox 是整格，邻居朝向面的实际形状不完整时也必须保留 quad。 */
+    private static void incompleteNeighborFaceIsKept() {
+        float[] qMin = { 1f, 0.5f, 0f };
+        float[] qMax = { 1f, 1f, 1f };
+        float[] nMin = { 0f, 0f, 0f };
+        float[] nMax = { 1f, 1f, 1f };
+        check("整格 bbox 不足以证明邻居面完整", !InternalFaceCulling.shouldCull(
+            qMin, qMax, 0, true, nMin, nMax,
+            InternalFaceCulling.ConnectKind.MATERIAL, false, false, true, false, false));
+    }
+
+    /** 透明块无需 isFullCube=true；完整朝向面仍可用于剔除。 */
+    private static void completeTransparentNeighborFaceIsCulled() {
+        float[] qMin = { 1f, 0f, 0f };
+        float[] qMax = { 1f, 1f, 1f };
+        float[] nMin = { 0f, 0f, 0f };
+        float[] nMax = { 1f, 1f, 1f };
+        check("透明邻居的完整面仍可剔除", InternalFaceCulling.shouldCull(
+            qMin, qMax, 0, true, nMin, nMax,
+            InternalFaceCulling.ConnectKind.BLOCK, true, true, true, true, true));
+    }
+
+    /** 楼梯可能有完整的朝向面；不能因为不是 full cube 而一概禁用剔除。 */
+    private static void completeStairFaceIsCulled() {
+        float[] qMin = { 1f, 0f, 0f };
+        float[] qMax = { 1f, 1f, 1f };
+        float[] nMin = { 0f, 0f, 0f };
+        float[] nMax = { 1f, 1f, 1f };
+        check("楼梯完整朝向面覆盖时可剔除", InternalFaceCulling.shouldCull(
+            qMin, qMax, 0, true, nMin, nMax,
+            InternalFaceCulling.ConnectKind.MATERIAL, false, false, true, false, true));
     }
 
     /**
@@ -132,7 +168,7 @@ public final class InternalFaceCullingTest {
             InternalFaceCulling.ConnectKind.STATE, false, false, true, true));
     }
 
-    /** connect=material：同材质即可（石砖 ↔ 石砖楼梯）。 */
+    /** connect=material：同材质即可，几何覆盖和邻居面形状仍须分别成立。 */
     private static void materialSemantics() {
         float[] qMin = { 1f, 0f, 0f };
         float[] qMax = { 1f, 1f, 0.5f };
